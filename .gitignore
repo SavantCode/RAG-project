@@ -1,1 +1,17 @@
+# Node dependencies
+node_modules/
+
+# Python virtual environments & cache
+venv/
+__pycache__/
+*.pyc
+
+# Build outputs & environment variables
+dist/
+build/
 .env
+
+# Vector databases / Local RAG storage (adjust folder name if needed)
+chroma_db/
+*.db
+*.sqlite3

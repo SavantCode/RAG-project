@@ -1,44 +1,59 @@
-from deepagents import create_deep_agent
-from langchain.chat_models import init_chat_model
-from prompts import RAG_WORKFLOW_INSTRUCTIONS, SUBAGENT_DELEGATION_INSTRUCTIONS, CHUNK_ANALYST_INSTRUCTIONS
-from tools import search_documentation, backend
-from langchain.messages import HumanMessage
+import os
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage
+from dotenv import load_dotenv
+from filereader import read_multiple_pdfs
+from prompts import RAG_WORKFLOW_INSTRUCTIONS
 
-max_concurrent_analysts = 3
+# Load environment variables
+load_dotenv()
 
-INSTUCTUTIONS = (
-    RAG_WORKFLOW_INSTRUCTIONS
-    + "\n\n"
-    + "="*80
-    + "\n\n"
-    + SUBAGENT_DELEGATION_INSTRUCTIONS.format(
-        max_concurrent_analysts=max_concurrent_analysts
-    )
-)
+# 1. Initialize free local embeddings & vector store
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+vector_store = InMemoryVectorStore(embeddings)
 
-chunk_analyst_subagent = {
-    "name": "chunk-analyst",
-    "description": (
-        "analyse one retreived documentation chunk file"
-        "Pass the use question and a single file path under /retrieved/."
-    ),
-    "system_prompt": CHUNK_ANALYST_INSTRUCTIONS
-}
+DOC_PATHS = [
+    "pdfs/climate_change.pdf",
+    "pdfs/global_warming.pdf"
+]
 
-model = init_chat_model(model="openai:gpt-5.5")
+docs = read_multiple_pdfs(DOC_PATHS)
+splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+chunks = splitter.split_documents(docs)
+vector_store.add_documents(chunks)
+print(f"Indexed {len(chunks)} chunks into vector store.")
 
-agent = create_deep_agent(
-    model=model,
-    tools=[search_documentation],
-    backend=backend,
-    system_prompt=INSTUCTUTIONS,
-    subagents=[chunk_analyst_subagent]
-)
+# 2. Define the search tool
+@tool
+def search_documentation(query: str) -> str:
+    """Search uploaded documents and return matching text chunks."""
+    retrieved_docs = vector_store.similarity_search(query, k=min(4, len(chunks)))
+    results = []
+    for i, doc in enumerate(retrieved_docs, start=1):
+        source = doc.metadata.get('source', 'unknown')
+        results.append(f"--- Chunk {i} (Source: {source}) ---\n{doc.page_content}")
+    return "\n\n".join(results)
 
-example_query = "what are the cause of climate change"
+# 3. Initialize Groq Model
+model_name = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+llm = ChatGroq(model=model_name, temperature=0.1)
 
-result = agent.invoke(
-    {"messages": [HumanMessage(content=example_query)]}
-)
+# 4. Test run query
+query = "what are the cause of climate change"
+context = search_documentation.invoke(query)
 
-print(result["messages"][-1].content)
+prompt = f"""{RAG_WORKFLOW_INSTRUCTIONS}
+
+Context documents:
+{context}
+
+User Question: {query}
+"""
+
+response = llm.invoke([HumanMessage(content=prompt)])
+print("\n--- AI Response ---")
+print(response.content)
