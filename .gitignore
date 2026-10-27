@@ -6,12 +6,20 @@ venv/
 __pycache__/
 *.pyc
 
+clean_env/
+venv/
+.env
+chroma_db/
+__pycache__/
+
 # Build outputs & environment variables
 dist/
 build/
 .env
 
+
 # Vector databases / Local RAG storage (adjust folder name if needed)
 chroma_db/
 *.db
 *.sqlite3
+./pdf
