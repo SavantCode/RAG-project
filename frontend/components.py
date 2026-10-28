@@ -1,6 +1,21 @@
 """
 Separated Frontend UI Components Module.
 Renders Sidebar, Hero Banner, Source Citations, and Interactive Chat Interface.
+
+Key Architectural Features:
+---------------------------
+1. Zero-Disk-I/O Session Label Resolution (`_peek_bucket`):
+   Computes smart 3-tier session labels (Custom Name -> Auto-Numbered Filename -> #UUID)
+   purely from in-memory `st.session_state` to prevent ChromaDB lock contention.
+2. Per-File Scope Filtering & Granular Deletion:
+   Allows users to restrict RAG retrieval to specific documents inside a session or remove
+   individual files without wiping the entire session.
+3. Transparent Hybrid Retrieval Badges:
+   Displays whether each source chunk was matched via FTS5 Keyword, Categorical B-Tree, or Vector MMR.
+4. Full Session Document Inventory Manifest:
+   Injects the complete list of all indexed filenames, chunk counts, and spreadsheet tabs
+   into the LLM context header so meta-questions (e.g., "How many files do you have?")
+   are answered with 100% accuracy regardless of Top-K limits.
 """
 
 from __future__ import annotations
@@ -15,6 +30,7 @@ import streamlit as st
 from langchain_chroma import Chroma
 
 from engine.config import MAX_FILE_MB, MAX_FILES
+from engine.hybrid_index import get_session_inventory
 from engine.llm_service import (
     build_messages,
     fetch_active_groq_models,
@@ -22,6 +38,7 @@ from engine.llm_service import (
     stream_with_auto_fallback,
 )
 from engine.storage import (
+    delete_single_file_from_session,
     extract_indexed_filenames,
     get_session_vector_store,
     hybrid_retrieve,
@@ -33,23 +50,33 @@ from frontend.styles import working_pill
 
 
 def ensure_session_bucket(session_id: str) -> dict:
-    """Ensure isolated state dictionary exists for session_id."""
+    """
+    Ensure an isolated state dictionary exists for `session_id`.
+    Automatically backfills missing keys (`name`, `active_files`) for backward compatibility
+    with older sessions loaded from disk.
+    """
     store = get_session_vector_store(session_id)
-    restored_files = extract_indexed_filenames(store)
+    restored_files = extract_indexed_filenames(store, session_id)
 
     if session_id not in st.session_state.session_data:
         st.session_state.session_data[session_id] = {
             "name": "",
             "messages": [],
             "indexed_files": restored_files,
+            "active_files": [],  # Empty list means "search all files in session"
             "index_stats": None,
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
     else:
-        if "name" not in st.session_state.session_data[session_id]:
-            st.session_state.session_data[session_id]["name"] = ""
+        bucket = st.session_state.session_data[session_id]
+        if "name" not in bucket:
+            bucket["name"] = ""
+        if "active_files" not in bucket:
+            bucket["active_files"] = []
         if restored_files:
-            st.session_state.session_data[session_id]["indexed_files"] = restored_files
+            bucket["indexed_files"] = restored_files
+            # Prune any active_files filter entries that no longer exist
+            bucket["active_files"] = [f for f in bucket["active_files"] if f in restored_files]
     return st.session_state.session_data[session_id]
 
 
@@ -58,7 +85,7 @@ def _peek_bucket(session_id: str) -> dict:
     session_data = st.session_state.get("session_data", {})
     if session_id in session_data and isinstance(session_data[session_id], dict):
         return session_data[session_id]
-    return {"name": "", "messages": [], "indexed_files": []}
+    return {"name": "", "messages": [], "indexed_files": [], "active_files": []}
 
 
 def get_session_base_label(session_id: str) -> str:
@@ -66,7 +93,7 @@ def get_session_base_label(session_id: str) -> str:
     Fast in-memory label calculation:
     1. Custom name if set by user
     2. First indexed filename (with (2), (3) if another unnamed session has the same first file)
-    3. Fallback to #{session_id}
+    3. Fallback to Session #{session_id}
     """
     bucket = _peek_bucket(session_id)
     custom_name = str(bucket.get("name") or "").strip()
@@ -157,7 +184,7 @@ def process_documents_action(uploaded_files: list, session_id: str, append_mode:
         )
 
     bucket = ensure_session_bucket(session_id)
-    bucket["indexed_files"] = extract_indexed_filenames(result["store"]) or result["good_files"]
+    bucket["indexed_files"] = extract_indexed_filenames(result["store"], session_id) or result["good_files"]
     bucket["index_stats"] = {
         "files": len(bucket["indexed_files"]),
         "chunks": result["chunks"],
@@ -180,7 +207,7 @@ def format_chat_export(session_id: str, messages: list) -> str:
 
 
 def render_sidebar(session_id: str, store: Chroma | None) -> None:
-    """Render the complete Sessions Manager, Knowledge Base uploader, and Settings sidebar."""
+    """Render the complete Sessions Manager, Knowledge Base uploader, File Filter, and Settings sidebar."""
     bucket = ensure_session_bucket(session_id)
 
     with st.sidebar:
@@ -250,7 +277,7 @@ def render_sidebar(session_id: str, store: Chroma | None) -> None:
 
         if store is not None:
             chunk_count = store._collection.count()
-            indexed_files = bucket.get("indexed_files") or extract_indexed_filenames(store)
+            indexed_files = bucket.get("indexed_files") or extract_indexed_filenames(store, session_id)
             bucket["indexed_files"] = indexed_files
             pills = "".join(f'<span class="file-pill">📄 {html.escape(f)}</span>' for f in indexed_files[:12])
             if len(indexed_files) > 12:
@@ -267,6 +294,41 @@ def render_sidebar(session_id: str, store: Chroma | None) -> None:
                 f'<div style="margin-top:0.4rem">{pills}</div></div>',
                 unsafe_allow_html=True,
             )
+
+            # Improvement: Per-File Scope Filter & Single-File Deletion UI
+            if indexed_files:
+                with st.expander("🗂️ Filter / Manage Files", expanded=False):
+                    selected_scope = st.multiselect(
+                        "🎯 Scope Search to File(s)",
+                        options=indexed_files,
+                        default=[f for f in bucket.get("active_files", []) if f in indexed_files],
+                        key=f"scope_files_{session_id}",
+                        placeholder="All indexed files (default)",
+                        help="Select specific file(s) to restrict search, or leave empty to search all files.",
+                    )
+                    if selected_scope != bucket.get("active_files", []):
+                        bucket["active_files"] = selected_scope
+                        save_disk_metadata()
+
+                    st.markdown("---")
+                    file_to_remove = st.selectbox(
+                        "Remove a Single File",
+                        options=indexed_files,
+                        key=f"del_file_select_{session_id}",
+                    )
+                    if st.button(
+                        "🗑️ Remove Selected File",
+                        use_container_width=True,
+                        key=f"del_file_btn_{session_id}",
+                    ):
+                        removed_count = delete_single_file_from_session(session_id, file_to_remove)
+                        bucket["indexed_files"] = [f for f in indexed_files if f != file_to_remove]
+                        bucket["active_files"] = [
+                            f for f in bucket.get("active_files", []) if f != file_to_remove
+                        ]
+                        save_disk_metadata()
+                        st.toast(f"Removed `{file_to_remove}` ({removed_count} chunks)!", icon="🗑️")
+                        st.rerun()
 
         st.markdown("---")
         st.markdown("### ◈ Knowledge Base")
@@ -346,13 +408,21 @@ def render_hero_header(session_id: str, ready: bool, store: Chroma | None) -> No
     status_text = f"Ready · {store._collection.count():,} Indexed Chunks" if ready and store else "Awaiting Documents"
     display_title = get_session_display_name(session_id)
 
+    bucket = _peek_bucket(session_id)
+    active_files = bucket.get("active_files") or []
+    scope_note = (
+        f" · 🎯 Scoped to {len(active_files)} file(s)"
+        if active_files
+        else ""
+    )
+
     st.markdown(
         f"""
         <section class="rag-hero">
             <div class="rag-topbar">
                 <div class="rag-eyebrow">
                     <span class="status-dot {dot_class}"></span>
-                    Groq · Polars Calamine + Hybrid Chroma RAG · {status_text}
+                    Groq · Polars Calamine + Hybrid Chroma RAG · {status_text}{html.escape(scope_note)}
                 </div>
                 <div style="color: #94a3b8; font-size: 0.8rem;">Model: <code>{html.escape(st.session_state.selected_model)}</code></div>
             </div>
@@ -367,7 +437,10 @@ def render_hero_header(session_id: str, ready: bool, store: Chroma | None) -> No
 
 
 def render_sources(sources: list[dict]) -> None:
-    """Render expandable source citation cards with escaped HTML."""
+    """
+    Render expandable source citation cards with escaped HTML and Hybrid Retrieval Match Badges.
+    Shows whether a passage came from FTS5 Keyword Search, Categorical Filter, or Vector Search.
+    """
     if not sources:
         return
     with st.expander(f"📚 Sources ({len(sources)})"):
@@ -379,12 +452,18 @@ def render_sources(sources: list[dict]) -> None:
                 if isinstance(s.get("match_pct"), int)
                 else ""
             )
+            match_type = str(s.get("match_type") or "").strip()
+            badge_html = (
+                f' <span class="file-pill" style="border-color:#4f46e5;color:#a5b4fc;">{html.escape(match_type)}</span>'
+                if match_type
+                else ""
+            )
             raw_text = str(s.get("text", ""))
             snippet = html.escape(raw_text[:450] + ("…" if len(raw_text) > 450 else ""))
             st.markdown(
                 f"""
                 <div class="source-card">
-                    <div><b>{idx}. 📄 {safe_source}{page_str}</b>{match_str}</div>
+                    <div><b>{idx}. 📄 {safe_source}{page_str}</b>{match_str}{badge_html}</div>
                     <div class="source-snippet">{snippet}</div>
                 </div>
                 """,
@@ -411,6 +490,7 @@ def handle_user_question(question: str, session_id: str, store: Chroma) -> None:
     answer = ""
     used_model = st.session_state.selected_model
     errored = False
+    active_files = bucket.get("active_files") or None
 
     with st.chat_message("assistant"):
         with st.status("🔎 Searching your documents (Categorical + FTS5 + Vector)…", expanded=False) as status:
@@ -428,8 +508,13 @@ def handle_user_question(question: str, session_id: str, store: Chroma) -> None:
                     question=search_query,
                     top_k=st.session_state.top_k,
                     use_mmr=use_mmr,
+                    allowed_files=active_files,
                 )
-                status.update(label=f"Found {len(sources)} relevant passages/rows", state="complete")
+                scope_msg = f" (scoped to {len(active_files)} file(s))" if active_files else ""
+                status.update(
+                    label=f"Found {len(sources)} relevant passages/rows{scope_msg}",
+                    state="complete",
+                )
             except Exception as exc:
                 status.update(label="Search failed", state="error")
                 answer = friendly_error(exc)
@@ -443,10 +528,32 @@ def handle_user_question(question: str, session_id: str, store: Chroma) -> None:
                 placeholder.markdown(answer)
             else:
                 placeholder.markdown(working_pill("Thinking"), unsafe_allow_html=True)
-                context = "\n\n".join(
+
+                # Build complete session file manifest so the LLM always knows ALL uploaded files
+                inv = get_session_inventory(session_id)
+                all_files = bucket.get("indexed_files") or [f["file_name"] for f in inv.get("files", [])]
+                if inv.get("files"):
+                    file_lines = [
+                        f"- {f['file_name']} ({f['chunks']} rows/chunks"
+                        + (f", sheets: {', '.join(f['sheets'])}" if f.get("sheets") else "")
+                        + ")"
+                        for f in inv["files"]
+                    ]
+                else:
+                    file_lines = [f"- {fname}" for fname in all_files]
+
+                manifest_header = (
+                    f"=== SESSION DOCUMENT INVENTORY (Total Indexed Files: {len(file_lines)}) ===\n"
+                    + "\n".join(file_lines)
+                    + "\n==================================================================\n\n"
+                )
+
+                passages_text = "\n\n".join(
                     f"Source ({s['source']}{', row/page ' + str(s['page']) if s.get('page') else ''}):\n{s['text']}"
                     for s in sources
                 )
+                context = manifest_header + passages_text
+
                 try:
                     prompt_msgs = build_messages(prior_messages, question, context)
                     answer, used_model = stream_with_auto_fallback(prompt_msgs, placeholder)
