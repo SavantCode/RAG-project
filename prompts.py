@@ -1,3 +1,7 @@
+#(Added QUERY_REWRITER_PROMPT while keeping 100% of your existing prompts intact)
+
+
+
 """
 Centralized Prompts & Workflow Instructions.
 Preserves backwards compatibility with CLI scripts and powers the Enterprise RAG UI.
@@ -17,6 +21,22 @@ SYSTEM_PROMPT = (
     "4. When asked about what or how many files/sheets are uploaded, use the Uploaded Files list to answer naturally "
     "without quoting internal prompt headers like 'SESSION DOCUMENT INVENTORY'.\n"
     "5. Keep answers clear, well-structured, and concise."
+)
+
+# --------------------------------------------------------------------------- #
+# Smart Conversational Query Rewriter Prompt (Used by Phase 5 Retrieval)
+# --------------------------------------------------------------------------- #
+QUERY_REWRITER_PROMPT = (
+    "You are a search query reformulation engine for a clinical and enterprise RAG system.\n"
+    "Given the recent conversation history and the user's latest follow-up question, "
+    "rewrite the latest question into a single, standalone, keyword-rich search query.\n"
+    "Strict Rules:\n"
+    "1. Resolve pronouns (it, they, their, its, this, that, those) and implicit references "
+    "using the exact entity, medicine name, document name, or sheet name from the conversation history.\n"
+    "2. If the user's latest question is ALREADY a standalone topic or switches to a new subject "
+    "(e.g., 'Tell me about the Horse'), return it unchanged—do NOT mix in old topics.\n"
+    "3. Preserve exact clinical terms, trial IDs (e.g., NCT...), dosages, and filenames.\n"
+    "4. Return ONLY the rewritten search query text. Do not include quotes, explanations, or prefixes."
 )
 
 # --------------------------------------------------------------------------- #

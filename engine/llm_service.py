@@ -1,7 +1,8 @@
+# (Added _needs_contextual_rewrite() heuristic gatekeeper and rewrite_conversational_query() with automatic fallback)
 """
 Groq LLM Service Module.
-Handles live model discovery, prompt message assembly, friendly error formatting,
-and auto-fallback streaming if a model returns 404 or is decommissioned.
+Handles live model discovery, conversational query rewriting, prompt message assembly,
+friendly error formatting, and auto-fallback streaming if a model returns 404 or is decommissioned.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 
 from engine.config import FALLBACK_GROQ_MODELS, HISTORY_TURNS
-from prompts import SYSTEM_PROMPT
+from prompts import QUERY_REWRITER_PROMPT, SYSTEM_PROMPT
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -58,6 +59,110 @@ def fetch_active_groq_models() -> list[str]:
             models.append(fb)
 
     return models
+
+
+def _needs_contextual_rewrite(question: str, prior_messages: list) -> bool:
+    """
+    Stage 1 Gatekeeper (<0.1ms):
+    Determines whether the user's question relies on prior conversation context.
+    Skips LLM rewriting for first turns or obvious standalone meta-questions.
+    """
+    if not prior_messages:
+        return False
+
+    q_clean = question.lower().strip()
+    words = re.findall(r"[a-z0-9_]+", q_clean)
+    if not words:
+        return False
+
+    # Skip rewriting for session inventory meta-questions
+    meta_phrases = ("how many files", "what files", "which files", "list all files", "uploaded files")
+    if any(p in q_clean for p in meta_phrases):
+        return False
+
+    # Trigger 1: Contains pronouns or demonstrative references that require resolution
+    referential_pronouns = {
+        "it", "its", "they", "them", "their", "theirs",
+        "this", "that", "these", "those", "he", "she", "his", "her",
+        "same", "other", "another", "both", "former", "latter",
+    }
+    if any(w in referential_pronouns for w in words):
+        return True
+
+    # Trigger 2: Starts with conversational follow-up connectors
+    followup_starters = (
+        "what about", "how about", "and ", "also ", "why ", "how much",
+        "how many", "what are the", "what is the", "can you", "tell me more",
+        "elaborate", "compare", "in which", "on which", "where ", "when ",
+    )
+    if any(q_clean.startswith(prefix) for prefix in followup_starters):
+        return True
+
+    # Trigger 3: Short elliptical follow-up (<= 7 words)
+    if len(words) <= 7:
+        return True
+
+    return False
+
+
+def rewrite_conversational_query(question: str, prior_messages: list) -> str:
+    """
+    Stage 2 Smart Conversational Query Rewriter:
+    Replaces the naive `<= 6 words` string concatenation with an intelligent,
+    context-aware LLM reformulation that resolves pronouns and implicit entities
+    while avoiding topic-switch pollution.
+
+    Returns:
+        A standalone search query string (or the original `question` if no rewrite is needed).
+    """
+    if not _needs_contextual_rewrite(question, prior_messages):
+        return question
+
+    # Extract the last 3 conversation turns (up to 6 messages) for compact, fast context
+    valid_history = [m for m in prior_messages if not m.get("error") and m.get("content")][-6:]
+    if not valid_history:
+        return question
+
+    history_lines: list[str] = []
+    for m in valid_history:
+        role_label = "User" if m["role"] == "user" else "Assistant"
+        # Truncate long assistant answers to the first 300 chars to keep latency < 200ms
+        snippet = m["content"][:300].replace("\n", " ")
+        history_lines.append(f"{role_label}: {snippet}")
+
+    history_block = "\n".join(history_lines)
+    rewrite_messages = [
+        SystemMessage(content=QUERY_REWRITER_PROMPT),
+        HumanMessage(
+            content=(
+                f"Recent Conversation History:\n{history_block}\n\n"
+                f"Latest User Question: {question}\n\n"
+                "Standalone Search Query:"
+            )
+        ),
+    ]
+
+    # Prefer ultra-fast 8B instant model for query rewriting if available, else current model
+    active_models = fetch_active_groq_models()
+    fast_candidates = [m for m in ("llama-3.1-8b-instant", st.session_state.get("selected_model", "")) if m]
+    for m in active_models:
+        if m not in fast_candidates:
+            fast_candidates.append(m)
+
+    for model_id in fast_candidates[:3]:
+        try:
+            llm = ChatGroq(model=model_id, temperature=0.0, max_tokens=80, max_retries=1)
+            resp = llm.invoke(rewrite_messages)
+            rewritten = (resp.content if isinstance(resp.content, str) else "").strip()
+            # Clean any accidental surrounding quotes or prefixes
+            rewritten = re.sub(r"^(standalone search query:|search query:|query:)\s*", "", rewritten, flags=re.I)
+            rewritten = rewritten.strip("\"'` \n")
+            if rewritten and len(rewritten) >= 2:
+                return rewritten
+        except Exception:
+            continue
+
+    return question
 
 
 def build_messages(prior_messages: list, question: str, context: str) -> list:

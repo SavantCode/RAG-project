@@ -1,3 +1,10 @@
+# Update frontend/components.py (Wire in rewrite_conversational_query + UI Telemetry)
+# In frontend/components.py, we simply:
+
+# Import rewrite_conversational_query from engine.llm_service.
+# Replace the old 4-line if len(question.split()) <= 6: block inside handle_user_question() with search_query = rewrite_conversational_query(question, prior_messages).
+# Display a subtle caption when a follow-up question was rewritten (e.g., 🔄 Rewritten query: "What are the cultural roles of the cow in Hinduism?").
+
 """
 Separated Frontend UI Components Module.
 Renders Sidebar, Hero Banner, Source Citations, and Interactive Chat Interface.
@@ -12,9 +19,12 @@ Key Architectural Features:
    individual files without wiping the entire session.
 3. Enterprise Color-Coded Hybrid Retrieval Badges:
    Displays a Hybrid Retrieval Breakdown bar and color-coded pills (Categorical, FTS5, Vector).
-4. Smart Irrelevant-Source Suppression:
+4. Smart Conversational Query Rewriter:
+   Replaces naive word-count concatenation with an LLM-powered coreference & entity resolver
+   for multi-turn follow-up questions.
+5. Smart Irrelevant-Source Suppression:
    Automatically hides source citations when the assistant indicates the requested topic
-   was not found in the uploaded documents (e.g., out-of-scope queries like "butterfly" or "hij").
+   was not found in the uploaded documents.
 """
 
 from __future__ import annotations
@@ -35,6 +45,7 @@ from engine.llm_service import (
     build_messages,
     fetch_active_groq_models,
     friendly_error,
+    rewrite_conversational_query,
     stream_with_auto_fallback,
 )
 from engine.storage import (
@@ -460,7 +471,6 @@ def render_sources(sources: list[dict]) -> None:
         return
 
     with st.expander(f"📚 Sources & Hybrid Attribution ({len(sources)})"):
-        # Compute per-layer match counts (supports both structured badges and legacy match_type strings)
         cat_count = sum(
             1
             for s in sources
@@ -497,7 +507,6 @@ def render_sources(sources: list[dict]) -> None:
 
             badges = s.get("badges")
             if not badges:
-                # Backward-compatible conversion if source came from earlier session format
                 badges = []
                 m_type = str(s.get("match_type") or "")
                 pct = s.get("match_pct")
@@ -532,7 +541,7 @@ def render_sources(sources: list[dict]) -> None:
 
 
 def handle_user_question(question: str, session_id: str, store: Chroma) -> None:
-    """Execute Phase 5 Hybrid Search and stream the LLM answer to the chat UI."""
+    """Execute Smart Query Rewriting, Phase 5 Hybrid Search, and stream the LLM answer."""
     clean_q = question.lower().strip()
     if clean_q in ["delete session", "delete this session", "clear session", "/delete"]:
         delete_session_action(session_id)
@@ -551,15 +560,16 @@ def handle_user_question(question: str, session_id: str, store: Chroma) -> None:
     used_model = st.session_state.selected_model
     errored = False
     active_files = bucket.get("active_files") or None
+    rewritten_query: str | None = None
 
     with st.chat_message("assistant"):
         with st.status("🔎 Searching your documents (Categorical + FTS5 + Vector)…", expanded=False) as status:
             try:
-                search_query = question
-                if len(question.split()) <= 6 and prior_messages:
-                    prev_user_qs = [m["content"] for m in prior_messages if m["role"] == "user"]
-                    if prev_user_qs:
-                        search_query = f"{prev_user_qs[-1]} {question}"
+                # Stage 0: Smart Conversational Query Rewriter (resolves pronouns & follow-up context)
+                search_query = rewrite_conversational_query(question, prior_messages)
+                if search_query.strip().lower() != question.strip().lower():
+                    rewritten_query = search_query
+                    st.write(f"🔄 **Contextualized Search Query:** `{search_query}`")
 
                 use_mmr = "MMR" in st.session_state.get("search_type", "MMR")
                 sources = hybrid_retrieve(
@@ -589,7 +599,6 @@ def handle_user_question(question: str, session_id: str, store: Chroma) -> None:
             else:
                 placeholder.markdown(working_pill("Thinking"), unsafe_allow_html=True)
 
-                # Build clean session file overview so the LLM knows all uploaded files
                 inv = get_session_inventory(session_id)
                 all_files = bucket.get("indexed_files") or [f["file_name"] for f in inv.get("files", [])]
                 if inv.get("files"):
@@ -626,13 +635,13 @@ def handle_user_question(question: str, session_id: str, store: Chroma) -> None:
         else:
             placeholder.markdown(answer)
 
-        # Suppress misleading sources if the LLM stated the topic was not in the documents
         if _is_not_found_answer(answer):
             sources = []
 
         elapsed = time.time() - started
         if not errored:
-            st.caption(f"Answered in {elapsed:.1f}s · Model: `{used_model}`")
+            rewrite_note = f" · 🔄 Searched: `{rewritten_query}`" if rewritten_query else ""
+            st.caption(f"Answered in {elapsed:.1f}s · Model: `{used_model}`{rewrite_note}")
             render_sources(sources)
 
     bucket["messages"].append(
