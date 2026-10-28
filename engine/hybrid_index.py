@@ -1,3 +1,7 @@
+# Update engine/hybrid_index.py
+# (Updated search_fts_keywords so each FTS5 hit carries structured badge flags: matched_fts=True, matched_category=bool(...), and category_detail)
+
+
 """
 Phase 4 & Phase 5 (Step 1): Dual-Layer Database Index.
 
@@ -60,7 +64,6 @@ def init_hybrid_db() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cat_med ON chunk_metadata(session_id, medicine_name)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cat_sheet ON chunk_metadata(session_id, sheet_name)")
-        # Improvement: Added B-Tree index on (session_id, file_name) for fast single-file deletion & scoping
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cat_file ON chunk_metadata(session_id, file_name)")
 
         # Index 2: Full-Text Keyword Index (SQLite FTS5 with custom tokenchars for clinical terms)
@@ -108,7 +111,6 @@ def index_micro_batch_into_hybrid_db(session_id: str, docs: list[Document], ids:
             """,
             meta_rows,
         )
-        # FTS5 virtual tables do not support INSERT OR REPLACE, so we delete existing IDs first
         conn.executemany("DELETE FROM chunk_fts WHERE chunk_id = ?", [(c,) for c in ids])
         conn.executemany(
             "INSERT INTO chunk_fts (chunk_id, session_id, medicine_name, sheet_name, content) VALUES (?, ?, ?, ?, ?)",
@@ -131,13 +133,9 @@ def delete_file_from_hybrid_db(session_id: str, file_name: str) -> int:
     Improvement (Per-File Deletion):
     Removes all chunks belonging to a single `file_name` within a `session_id`
     from both `chunk_fts` and `chunk_metadata` without affecting other files in the session.
-
-    Returns:
-        Number of chunks removed from the hybrid index.
     """
     init_hybrid_db()
     with get_hybrid_conn() as conn:
-        # 1. Locate all chunk_ids associated with this file (checks both file_name and source prefix)
         rows = conn.execute(
             """
             SELECT chunk_id FROM chunk_metadata
@@ -150,7 +148,6 @@ def delete_file_from_hybrid_db(session_id: str, file_name: str) -> int:
         if not chunk_ids:
             return 0
 
-        # 2. Delete matching chunk_ids from both FTS5 and Categorical Metadata tables
         conn.executemany("DELETE FROM chunk_fts WHERE chunk_id = ?", chunk_ids)
         conn.executemany("DELETE FROM chunk_metadata WHERE chunk_id = ?", chunk_ids)
         conn.commit()
@@ -174,7 +171,6 @@ def detect_categorical_filters(
 
     try:
         with get_hybrid_conn() as conn:
-            # Scope categorical detection to allowed_files if the user selected specific files
             file_clause = ""
             params: list[Any] = [session_id]
             if allowed_files:
@@ -223,15 +219,15 @@ def search_fts_keywords(
     Phase 5 (Step 2 - Full-Text Keyword Search via SQLite FTS5 BM25):
     Matches exact clinical trial IDs (NCT02475681), molecular variants, and dosages.
 
-    Improvement:
-    - Supports `allowed_files` scoping so users can restrict keyword search to specific documents.
-    - Annotates each hit with `match_type` metadata so the UI can display transparent retrieval badges.
+    Enterprise Attribution Improvement:
+    - Annotates each hit with structured multi-layer attribution flags (`matched_fts`,
+      `matched_category`, `badges`) so `hybrid_retrieve()` can fuse FTS5 + Vector + Category signals.
     """
     init_hybrid_db()
     stop_words = {
         "what", "where", "when", "which", "who", "this", "that", "with", "from",
         "about", "the", "and", "for", "are", "was", "were", "have", "has", "does",
-        "summarize", "list", "show", "tell", "give", "find", "explain",
+        "summarize", "list", "show", "tell", "give", "find", "explain", "many", "files",
     }
     tokens = [t for t in re.findall(r"[A-Za-z0-9_\-]{2,}", question.lower()) if t not in stop_words][:8]
     if not tokens:
@@ -260,9 +256,7 @@ def search_fts_keywords(
     sql += " ORDER BY bm25(chunk_fts) LIMIT ?"
     params.append(top_k)
 
-    # Build a descriptive badge showing whether Categorical Hard Filtering assisted this FTS5 hit
-    cat_tag = " + 🏷️ Categorical" if (med_filter or sheet_filter) else ""
-    badge_label = f"🔤 FTS5 Keyword{cat_tag}"
+    has_cat = bool(med_filter or sheet_filter)
 
     hits: list[dict] = []
     try:
@@ -272,8 +266,10 @@ def search_fts_keywords(
                     {
                         "source": r["source"],
                         "page": r["page"],
-                        "match_pct": 95,
-                        "match_type": badge_label,
+                        "match_pct": None,
+                        "matched_category": has_cat,
+                        "matched_fts": True,
+                        "matched_vector": False,
                         "text": r["content"],
                     }
                 )

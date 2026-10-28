@@ -1,19 +1,12 @@
-# (Added delete_single_file_from_session(), file-scoped Chroma filtering, and match_type badges in hybrid_retrieve())
+# 3. Update engine/storage.py
+# (Upgraded hybrid_retrieve() with Multi-Signal Fusion so if a chunk matches FTS5 + Vector + Category, all badges and the exact Vector similarity % are combined onto the same source card!)
+
 """
 Phase 3 & Phase 5: ChromaDB Vector Storage, Streaming Micro-Batch Ingestion,
 Session State Persistence, Per-File Management, and High-Precision Hybrid Search.
 """
 
 from __future__ import annotations
-
-from engine.hybrid_index import (
-    delete_file_from_hybrid_db,
-    detect_categorical_filters,
-    get_session_inventory,
-    index_micro_batch_into_hybrid_db,
-    search_fts_keywords,
-    wipe_session_from_hybrid_db,
-)
 
 import gc
 import hashlib
@@ -42,6 +35,7 @@ from engine.config import (
 from engine.hybrid_index import (
     delete_file_from_hybrid_db,
     detect_categorical_filters,
+    get_session_inventory,
     index_micro_batch_into_hybrid_db,
     search_fts_keywords,
     wipe_session_from_hybrid_db,
@@ -194,23 +188,18 @@ def delete_single_file_from_session(session_id: str, file_name: str) -> int:
     Improvement (Granular Document Management):
     Deletes all vector embeddings and FTS5/Categorical rows belonging to `file_name`
     inside `session_id` without wiping the rest of the session's knowledge base.
-
-    Approach:
-    1. Queries ChromaDB collection metadata to find chunk IDs where `file_name` or `source` matches.
-    2. Deletes those vector IDs from ChromaDB.
-    3. Calls `delete_file_from_hybrid_db` to purge the corresponding SQLite FTS5 & B-Tree rows.
     """
     store = get_session_vector_store(session_id)
     removed_vectors = 0
 
     if store is not None:
         try:
-            data = store._collection.get(include=["metadatas"], limit=25000)
+            data = store._collection.get(include=["metadatas"], limit=50000)
             ids = data.get("ids") or []
             metadatas = data.get("metadatas") or []
 
             ids_to_delete = [
-                 doc_id
+                doc_id
                 for doc_id, meta in zip(ids, metadatas)
                 if isinstance(meta, dict)
                 and (
@@ -285,7 +274,6 @@ def route_uploaded_file_to_chunks(uploaded_file) -> list[Document]:
     else:
         raise ValueError(f"Unsupported file format: .{suffix}")
 
-    # Guarantee `file_name` is stamped on all chunks (even from PDF/TXT parsers) for filtering
     for c in chunks:
         if c.metadata is None:
             c.metadata = {}
@@ -365,7 +353,6 @@ def ingest_files_with_micro_batches(
             failed.append(f"{uf.name}: {exc}")
             log_fn(f"⚠️ **{html.escape(uf.name)}** skipped — {exc}")
 
-    # Flush final micro-batch
     _flush_micro_batch()
     elapsed = time.time() - started
 
@@ -378,8 +365,27 @@ def ingest_files_with_micro_batches(
     }
 
 
+def _build_source_badges(item: dict) -> list[dict[str, str]]:
+    """
+    Construct the list of structured, color-coded badge descriptors for a retrieved chunk:
+      - 🏷️ Exact Category Match (badge-category)
+      - 🔤 FTS5 Keyword Match   (badge-fts)
+      - 🧠 Semantic Vector (X%) (badge-vector)
+    """
+    badges: list[dict[str, str]] = []
+    if item.get("matched_category"):
+        badges.append({"label": "🏷️ Exact Category Match", "css": "badge-category"})
+    if item.get("matched_fts"):
+        badges.append({"label": "🔤 FTS5 Keyword Match", "css": "badge-fts"})
+    if item.get("matched_vector"):
+        pct = item.get("match_pct")
+        vec_label = f"🧠 Semantic Vector ({pct}%)" if isinstance(pct, int) else "🧠 Semantic Vector (MMR)"
+        badges.append({"label": vec_label, "css": "badge-vector"})
+    return badges
+
+
 # --------------------------------------------------------------------------- #
-# Phase 5: High-Precision Hybrid Search (Retrieval)
+# Phase 5: High-Precision Hybrid Search with Multi-Signal Attribution Fusion
 # --------------------------------------------------------------------------- #
 def hybrid_retrieve(
     store: Chroma,
@@ -390,18 +396,18 @@ def hybrid_retrieve(
     allowed_files: list[str] | None = None,
 ) -> list[dict]:
     """
-    Phase 5 Multi-Stage Hybrid Search:
-      - Step 0 (Optional File Scope): Restricts search to user-selected `allowed_files`.
-      - Step 1 (Hard Filtering via Categorical Indexes): Narrow search pool by `medicine_name` & `sheet_name`.
-      - Step 2 (Full-Text Keyword Lookup): Match exact clinical trial IDs (NCT...), variants (del(17p)).
-      - Step 3 (Semantic Vector Scan): Perform neural vector search (MMR or Similarity) on the filtered pool.
-      - Step 4 (Transparent Attribution): Tags each retrieved chunk with its `match_type` badge.
+    Phase 5 Enterprise Multi-Stage Hybrid Search:
+      - Step 1 (Categorical B-Tree Hard Filter): Narrows pool by `medicine_name` & `sheet_name`.
+      - Step 2 (SQLite FTS5 Keyword Search): BM25 ranking for exact clinical terms & IDs.
+      - Step 3 (Chroma Semantic Vector Search): MMR or Similarity search with score lookup.
+      - Step 4 (Multi-Signal Attribution Fusion): If a chunk is retrieved by BOTH FTS5 and Vector
+        search, fuses their attribution flags onto a single source entry and computes color-coded
+        pill badges (`🏷️ Exact Category Match`, `🔤 FTS5 Keyword Match`, `🧠 Semantic Vector (84%)`).
     """
     detected = detect_categorical_filters(session_id, question, allowed_files=allowed_files)
     med_filter = detected.get("medicine_name")
     sheet_filter = detected.get("sheet_name")
 
-    # Assemble ChromaDB metadata `where` filter combining Categorical filters + File Scope
     conditions: list[dict] = []
     if med_filter:
         conditions.append({"medicine_name": med_filter})
@@ -430,6 +436,19 @@ def hybrid_retrieve(
     )
 
     # Stage 3: Scoped Semantic Vector Search
+    # Also fetch similarity scores in a fast lookup map so MMR results still get an exact % score!
+    score_lookup: dict[str, int] = {}
+    try:
+        scored_pairs = store.similarity_search_with_score(
+            question, k=max(10, top_k * 2), filter=chroma_where
+        )
+        for s_doc, dist in scored_pairs:
+            if isinstance(dist, (int, float)):
+                pct = max(0, min(100, int((1.0 / (1.0 + max(0.0, float(dist)))) * 100)))
+                score_lookup[s_doc.page_content[:200]] = pct
+    except Exception:
+        scored_pairs = []
+
     vector_results = []
     used_cat_filter = bool(med_filter or sheet_filter)
     try:
@@ -439,12 +458,11 @@ def hybrid_retrieve(
             )
             vector_results = [(d, None) for d in docs]
         else:
-            vector_results = store.similarity_search_with_score(question, k=top_k, filter=chroma_where)
+            vector_results = scored_pairs[:top_k]
     except Exception:
         vector_results = []
 
     # Fallback: If hard categorical filter yielded 0 vector hits, relax categorical filter
-    # (while still honoring the user's `allowed_files` scope if set!)
     if not vector_results and chroma_where is not None:
         used_cat_filter = False
         file_only_where: dict | None = None
@@ -455,49 +473,69 @@ def hybrid_retrieve(
                 else {"file_name": {"$in": allowed_files}}
             )
         try:
+            scored_fallback = store.similarity_search_with_score(
+                question, k=max(10, top_k * 2), filter=file_only_where
+            )
+            for s_doc, dist in scored_fallback:
+                if isinstance(dist, (int, float)):
+                    pct = max(0, min(100, int((1.0 / (1.0 + max(0.0, float(dist)))) * 100)))
+                    score_lookup[s_doc.page_content[:200]] = pct
+
             if use_mmr:
                 docs = store.max_marginal_relevance_search(
                     question, k=top_k, fetch_k=max(10, top_k * 3), filter=file_only_where
                 )
                 vector_results = [(d, None) for d in docs]
             else:
-                vector_results = store.similarity_search_with_score(question, k=top_k, filter=file_only_where)
+                vector_results = scored_fallback[:top_k]
         except Exception:
             fallback_docs = store.similarity_search(question, k=top_k)
             vector_results = [(d, None) for d in fallback_docs]
 
-    # Stage 4: Merge, Deduplicate, and Tag Results with Retrieval Method Badges
-    sources: list[dict] = []
-    seen_texts: set[str] = set()
+    # Stage 4: Multi-Signal Attribution Fusion (Merge FTS5 + Vector + Categorical signals)
+    merged_by_sig: dict[str, dict] = {}
+    ordered_sigs: list[str] = []
 
     for hit in fts_hits:
         sig = hit["text"][:200]
-        if sig not in seen_texts:
-            seen_texts.add(sig)
-            sources.append(hit)
-
-    vec_mode_label = "🧠 Vector MMR" if use_mmr else "🧠 Vector Sim"
-    if used_cat_filter:
-        vec_mode_label += " + 🏷️ Categorical"
+        if sig not in merged_by_sig:
+            # Attach similarity % if Chroma also scored this chunk
+            hit["match_pct"] = score_lookup.get(sig)
+            merged_by_sig[sig] = hit
+            ordered_sigs.append(sig)
 
     for doc, distance in vector_results:
         sig = doc.page_content[:200]
-        if sig in seen_texts:
-            continue
-        seen_texts.add(sig)
         match_pct = (
             max(0, min(100, int((1.0 / (1.0 + max(0.0, float(distance)))) * 100)))
             if isinstance(distance, (int, float))
-            else None
+            else score_lookup.get(sig)
         )
-        sources.append(
-            {
+
+        if sig in merged_by_sig:
+            # Chunk was already found by FTS5! Fuse the Vector signal onto the existing entry
+            existing = merged_by_sig[sig]
+            existing["matched_vector"] = True
+            existing["matched_category"] = existing.get("matched_category") or used_cat_filter
+            if match_pct is not None:
+                existing["match_pct"] = match_pct
+        else:
+            merged_by_sig[sig] = {
                 "source": doc.metadata.get("source", "unknown"),
                 "page": doc.metadata.get("page"),
                 "match_pct": match_pct,
-                "match_type": vec_mode_label,
+                "matched_category": used_cat_filter,
+                "matched_fts": False,
+                "matched_vector": True,
                 "text": doc.page_content,
             }
-        )
+            ordered_sigs.append(sig)
 
-    return sources[:top_k]
+    # Finalize structured badges list for each source card
+    final_sources: list[dict] = []
+    for sig in ordered_sigs[:top_k]:
+        item = merged_by_sig[sig]
+        item["badges"] = _build_source_badges(item)
+        final_sources.append(item)
+
+    return final_sources
