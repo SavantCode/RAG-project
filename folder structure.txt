@@ -1,0 +1,21 @@
+RAG_LangChain/
+│
+├── .env                          # GROQ_API_KEY=...
+├── main.py                       # Clean Streamlit entry point & UI orchestrator
+├── requirements.txt              # Project dependencies
+├── chroma_db/                    # Auto-created: Vector DB + FTS5 Keyword DB + JSON state
+│
+└── src/                          # Modular Enterprise Core Package
+    ├── __init__.py
+    ├── config.py                 # Centralized constants, settings & system prompts
+    │
+    ├── parsers/                  # Modular File Parsers (Easy to add DOCX, HTML, JSON later!)
+    │   ├── __init__.py           # Parser Router (dispatches by file extension)
+    │   ├── excel_parser.py       # Phase 1 & 2: Polars + Calamine + Schema-Agnostic Row Slicer
+    │   ├── pdf_parser.py         # PDF page extractor + recursive chunker
+    │   └── text_parser.py        # TXT / Markdown parser + chunker
+    │
+    └── engine/                   # Phase 3, 4 & 5: Storage, Indexing & Hybrid Retrieval
+        ├── __init__.py
+        ├── hybrid_index.py       # Phase 4: Dual-Layer Categorical + FTS5 Full-Text Index
+        └── vector_store.py       # Phase 3 & 5: Streaming Micro-Batches + Hybrid Search
