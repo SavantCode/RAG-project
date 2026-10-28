@@ -131,3 +131,28 @@ git checkout -b feature/smart-query-rewriter
 
 
 ```
+
+---
+
+## Issue 10: Grounded Auto-Generated Follow-Up Questions & Reasoning-Model Token Exhaustion
+
+### ⚠️ Problem Statement
+Previously, the UI only displayed 4 static starter buttons (*"Summarize the main points"*, etc.) when a session was completely empty. Once the user asked their first question, those buttons disappeared permanently, leaving users without guided discovery across multi-document sessions.
+
+When we initially introduced LLM-generated follow-up buttons (`generate_followup_questions`), three subtle edge cases prevented the buttons from rendering:
+1. **Reasoning Model Token Exhaustion (`<think>...</think>`)**: When a reasoning-enabled Groq model (such as `openai/gpt-oss-20b`, `qwen-qwq`, or `deepseek-r1`) was selected, setting `max_tokens=110` caused the model to spend its entire token budget inside internal `<think>...</think>` reasoning blocks, returning 0 visible lines.
+2. **Strict Question-Mark Filtering**: The line parser initially required `cleaned.endswith("?")`. If an LLM returned imperative suggestions (e.g., *"Compare the cow and the horse"*) or if a brief API rate-limit occurred right after streaming the main response, the parser returned an empty list `[]`.
+3. **Legacy Chat State & Streamlit Rerun Binding**: Existing chat messages stored on disk before the update lacked the `"followups"` key in `session_data`, and typing a normal question in `st.chat_input` rendered inline without triggering `st.rerun()` to bind the interactive buttons in `main.py`'s replay loop.
+
+### ✅ Engineering Solution: 4-Layer Resilient Follow-Up Architecture
+Implemented across `prompts.py`, `engine/llm_service.py`, `frontend/components.py`, and `main.py`:
+1. **Source-Grounded Prompting (`FOLLOWUP_SUGGESTIONS_PROMPT`)**:
+   - Passes the top retrieved source snippets + the session's uploaded file inventory into `generate_followup_questions()`, strictly requiring that all 3 suggested questions (<10 words each) can be answered directly from the uploaded documents.
+2. **Reasoning Tag Stripping & Fast Model Priority (`_strip_thinking_tags`)**:
+   - Prioritizes fast non-reasoning instruct models (`llama-3.1-8b-instant`, `llama-3.3-70b-versatile`) for background helper calls, increases `max_tokens` to `350`, and strips any `<think>...</think>` blocks via regex before parsing lines.
+   - Automatically normalizes punctuation (appending `?` if omitted) and filters out conversational preambles (*"Here are 3 questions:"*).
+3. **Zero-Latency Deterministic Fallback (`_build_deterministic_followups`)**:
+   - If all LLM calls fail or rate-limit, `_build_deterministic_followups()` constructs 3 document-specific follow-up questions directly from the retrieved source filenames and session inventory, guaranteeing **100% uptime**.
+   - If the assistant's answer was an out-of-scope declaration (`_is_not_found_answer`), follow-up generation is automatically skipped so irrelevant suggestions are never shown.
+4. **Interactive One-Click Execution (`render_followup_pills` in `main.py`)**:
+   - Renders 3 clickable `↪ Question?` pill buttons right underneath the latest assistant response (with automatic fallback for legacy messages). Clicking any button sets `queued_prompt` and immediately executes the full Hybrid RAG pipeline.

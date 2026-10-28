@@ -22,6 +22,7 @@ from engine.storage import (
 from frontend.components import (
     ensure_session_bucket,
     handle_user_question,
+    render_followup_pills,
     render_hero_header,
     render_sidebar,
     render_sources,
@@ -110,14 +111,32 @@ def main() -> None:
             if q_cols[idx].button(prompt_text, use_container_width=True):
                 queued_prompt = prompt_text
 
-    # 5. Replay Chat History
-    for message in bucket["messages"]:
+    # 5. Replay Chat History & Render Clickable Follow-Up Pills on Latest Turn
+    total_msgs = len(bucket["messages"])
+    for msg_idx, message in enumerate(bucket["messages"]):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             if message["role"] == "assistant" and not message.get("error"):
                 if message.get("elapsed") is not None:
-                    st.caption(f"Answered in {message['elapsed']:.1f}s")
-                render_sources(message.get("sources", []))
+                    rewrite_info = (
+                        f" · 🔄 Searched: `{message['rewritten_query']}`"
+                        if message.get("rewritten_query")
+                        else ""
+                    )
+                    st.caption(f"Answered in {message['elapsed']:.1f}s{rewrite_info}")
+                sources = message.get("sources", [])
+                render_sources(sources)
+
+                # Show clickable follow-up question buttons underneath the most recent assistant message
+                if msg_idx == total_msgs - 1 and sources:
+                    followups = message.get("followups") or [
+                        "Summarize the key takeaways from this section?",
+                        "What specific facts or figures are mentioned?",
+                        "How does this relate to the other uploaded documents?",
+                    ]
+                    clicked_followup = render_followup_pills(followups, msg_idx, session_id)
+                    if clicked_followup:
+                        queued_prompt = clicked_followup
 
     # 6. Chat Input
     question = st.chat_input(
@@ -136,8 +155,7 @@ def main() -> None:
             return
 
         handle_user_question(active_question, session_id, store)
-        if queued_prompt:
-            st.rerun()
+        st.rerun()
 
 
 if __name__ == "__main__":

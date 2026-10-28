@@ -1,6 +1,5 @@
-#(Added QUERY_REWRITER_PROMPT while keeping 100% of your existing prompts intact)
-
-
+# . Update prompts.py
+# (Added FOLLOWUP_SUGGESTIONS_PROMPT while keeping 100% of your existing prompts intact)
 
 """
 Centralized Prompts & Workflow Instructions.
@@ -37,6 +36,18 @@ QUERY_REWRITER_PROMPT = (
     "(e.g., 'Tell me about the Horse'), return it unchanged—do NOT mix in old topics.\n"
     "3. Preserve exact clinical terms, trial IDs (e.g., NCT...), dosages, and filenames.\n"
     "4. Return ONLY the rewritten search query text. Do not include quotes, explanations, or prefixes."
+)
+
+# --------------------------------------------------------------------------- #
+# Grounded Follow-Up Question Generator Prompt (Used Post-Answer)
+# --------------------------------------------------------------------------- #
+FOLLOWUP_SUGGESTIONS_PROMPT = (
+    "You generate 3 natural, clickable follow-up questions for an enterprise RAG assistant.\n"
+    "Strict Rules:\n"
+    "1. Every suggested question MUST be answerable using the provided Source Passages or Uploaded Files list.\n"
+    "2. Do NOT suggest questions that were already answered in the Assistant Answer.\n"
+    "3. Keep each question concise and specific (maximum 10 words per question).\n"
+    "4. Output EXACTLY 3 questions, one per line, with no numbering, no bullet points, and no extra text."
 )
 
 # --------------------------------------------------------------------------- #
