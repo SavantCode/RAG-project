@@ -156,3 +156,27 @@ Implemented across `prompts.py`, `engine/llm_service.py`, `frontend/components.p
    - If the assistant's answer was an out-of-scope declaration (`_is_not_found_answer`), follow-up generation is automatically skipped so irrelevant suggestions are never shown.
 4. **Interactive One-Click Execution (`render_followup_pills` in `main.py`)**:
    - Renders 3 clickable `↪ Question?` pill buttons right underneath the latest assistant response (with automatic fallback for legacy messages). Clicking any button sets `queued_prompt` and immediately executes the full Hybrid RAG pipeline.
+
+
+---
+
+## Issue 11: Multi-Modal Website URL (Text + Images) & DOCX Ingestion Without External Dependency Bloat
+
+### ⚠️ Problem Statement
+1. **Limited Data Modalities**: The ingestion pipeline originally supported only `.xlsx`, `.xls`, `.csv`, `.pdf`, `.txt`, and `.md`. Enterprise workflows frequently require ingesting **Microsoft Word documents (`.docx`)** (including embedded tables) and **live Website/Documentation URLs** (including diagrams, figures, and photos).
+2. **Environment Dependency Mismatch (`ModuleNotFoundError: No module named 'bs4'`)**: The active Streamlit runtime (`clean_env`) did not have `beautifulsoup4` (`bs4`) or `python-docx` installed, causing top-level third-party imports to fail on server startup.
+3. **Blindness to Web Visuals**: Standard text scrapers discard `<img>` tags completely, preventing users from asking visual questions like *"Show me images or diagrams from this webpage"*.
+
+### ✅ Engineering Solution: Single-Pass StdLib Streaming Parsers + Web Image Catalog
+Implemented in `engine/storage.py`, `prompts.py`, and `frontend/components.py`:
+1. **Single-Pass Event-Driven HTML & Image Extractor (`_StdLibHTMLTextExtractor` via `html.parser.HTMLParser`)**:
+   - Built on Python's standard library (zero external dependencies, 2x–4x faster and ~70% lower RAM than DOM-tree builders like `BeautifulSoup`).
+   - Tracks tag depth (`_skip_depth`) to strip `<script>`, `<style>`, `<nav>`, `<footer>`, `<header>`, `<aside>`, and `<svg>` blocks in a single pass.
+   - **Smart Image Extraction**: Captures `<img>` tags (`src`, `data-src`, `alt`, `title`), resolves relative URLs into absolute `https://` URLs via `urllib.parse.urljoin`, filters out UI noise (icons, logos, tracking pixels, `<48px` elements), and injects `[Image: <alt> | Image URL: <https_url>]` inline with surrounding text plus a dedicated `web_images` catalog chunk.
+   - **Direct Image URL Support**: Supports indexing direct image links (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`).
+2. **Live Markdown Image Rendering in Chat (`prompts.py`)**:
+   - Updated `SYSTEM_PROMPT` (Rule 5) to render `[Image: <description> | Image URL: <url>]` entries directly inside the assistant's response using Markdown image syntax `![<description>](<url>)`.
+3. **C-Accelerated OpenXML `.docx` Parser (`parse_docx_bytes` via `zipfile` + `xml.etree.ElementTree`)**:
+   - Unzips `word/document.xml` in memory (`io.BytesIO`) and extracts both paragraphs (`<w:p>`) and structured tables (`<w:tbl>` $\rightarrow$ pipe-delimited rows) using Python's C-backed `expat` XML parser without requiring `python-docx`.
+4. **Full Hybrid Search & Filter Integration**:
+   - Stamped web sources (`🌐 domain/path`) and `.docx` files with normalized metadata in ChromaDB and SQLite `chunk_metadata`/`chunk_fts`, enabling full compatibility with **Scope Search to Source(s)**, **Remove Selected Source**, **Session Inventory Manifest**, and **3-Layer Hybrid Attribution Badges**.

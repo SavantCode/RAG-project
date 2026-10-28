@@ -1,3 +1,9 @@
+# 2. Update frontend/components.py
+# (Added .docx to the file uploader and added the 🌐 Add Website URLs expander + process_urls_action() in the sidebar while keeping 100% of your existing features intact!)
+
+# Copy and replace frontend/components.py with this complete file:
+
+
 """
 Separated Frontend UI Components Module.
 Renders Sidebar, Hero Banner, Source Citations, Suggested Follow-Ups, and Interactive Chat Interface.
@@ -8,8 +14,8 @@ Key Architectural Features:
    Computes smart 3-tier session labels (Custom Name -> Auto-Numbered Filename -> #UUID)
    purely from in-memory `st.session_state` to prevent ChromaDB lock contention.
 2. Per-File Scope Filtering & Granular Deletion:
-   Allows users to restrict RAG retrieval to specific documents inside a session or remove
-   individual files without wiping the entire session.
+   Allows users to restrict RAG retrieval to specific documents/URLs inside a session or remove
+   individual sources without wiping the entire session.
 3. Enterprise Color-Coded Hybrid Retrieval Badges:
    Displays a Hybrid Retrieval Breakdown bar and color-coded pills (Categorical, FTS5, Vector).
 4. Smart Conversational Query Rewriter:
@@ -18,6 +24,8 @@ Key Architectural Features:
 5. Grounded Auto-Generated Follow-Up Suggestions (`render_followup_pills`):
    Generates 3 clickable follow-up question buttons below the latest answer grounded in the
    retrieved source passages.
+6. Multi-Modal Ingestion (Excel, CSV, PDF, DOCX, TXT, MD + Live Website URLs):
+   Supports both file uploads (including Word `.docx`) and live Website URL scraping in the sidebar.
 """
 
 from __future__ import annotations
@@ -48,6 +56,7 @@ from engine.storage import (
     get_session_vector_store,
     hybrid_retrieve,
     ingest_files_with_micro_batches,
+    ingest_urls_with_micro_batches,
     save_disk_metadata,
     wipe_session_data,
 )
@@ -96,7 +105,7 @@ def get_session_base_label(session_id: str) -> str:
     """
     Fast in-memory label calculation:
     1. Custom name if set by user
-    2. First indexed filename (with (2), (3) if another unnamed session has the same first file)
+    2. First indexed filename/URL (with (2), (3) if another unnamed session has the same first source)
     3. Fallback to Session #{session_id}
     """
     bucket = _peek_bucket(session_id)
@@ -174,7 +183,7 @@ def delete_session_action(session_id: str) -> None:
 
 
 def process_documents_action(uploaded_files: list, session_id: str, append_mode: bool = True) -> None:
-    """Run Phase 1-4 ingestion with live Streamlit status & progress bar."""
+    """Run Phase 1-4 file ingestion with live Streamlit status & progress bar."""
     progress_bar = st.progress(0.0, text="Starting streaming micro-batch ingestion…")
 
     with st.status("⚙️ Processing & Streaming Micro-Batches…", expanded=True) as status:
@@ -218,6 +227,51 @@ def process_documents_action(uploaded_files: list, session_id: str, append_mode:
     st.rerun()
 
 
+def process_urls_action(urls: list[str], session_id: str, append_mode: bool = True) -> None:
+    """Scrape, chunk, and index live Website URLs into the current session."""
+    progress_bar = st.progress(0.0, text="Fetching & indexing website URLs…")
+
+    with st.status("🌐 Scraping & Indexing Website URL(s)…", expanded=True) as status:
+        try:
+            result = ingest_urls_with_micro_batches(
+                urls=urls,
+                session_id=session_id,
+                append_mode=append_mode,
+                log_fn=st.write,
+                progress_fn=lambda pct, msg: progress_bar.progress(pct, text=msg),
+            )
+        except Exception as exc:
+            progress_bar.empty()
+            status.update(label="URL ingestion failed", state="error", expanded=True)
+            st.error(f"Failed to index URL(s): {exc}")
+            return
+
+        progress_bar.empty()
+        if not result["good_files"]:
+            status.update(label="No readable web pages found", state="error", expanded=True)
+            st.error("Could not extract readable text from the provided URL(s).")
+            return
+
+        status.update(
+            label=f"Ready — {result['chunks']:,} total chunks indexed in {result['seconds']:.1f}s",
+            state="complete",
+            expanded=False,
+        )
+
+    bucket = ensure_session_bucket(session_id)
+    bucket["indexed_files"] = extract_indexed_filenames(result["store"], session_id) or result["good_files"]
+    bucket["index_stats"] = {
+        "files": len(bucket["indexed_files"]),
+        "chunks": result["chunks"],
+        "seconds": result["seconds"],
+        "failed": result["failed"],
+    }
+    save_disk_metadata()
+    st.session_state.uploader_key += 1
+    st.toast(f"Indexed {len(result['good_files'])} Website URL(s) into Session #{session_id}!", icon="🌐")
+    st.rerun()
+
+
 def format_chat_export(session_id: str, messages: list) -> str:
     display_name = get_session_display_name(session_id)
     lines = [f"# RAG Chat Transcript — Session `{display_name}`\n"]
@@ -228,7 +282,7 @@ def format_chat_export(session_id: str, messages: list) -> str:
 
 
 def render_sidebar(session_id: str, store: Chroma | None) -> None:
-    """Render the complete Sessions Manager, Knowledge Base uploader, File Filter, and Settings sidebar."""
+    """Render the complete Sessions Manager, Knowledge Base uploader, URL Ingester, File Filter, and Settings."""
     bucket = ensure_session_bucket(session_id)
 
     with st.sidebar:
@@ -310,7 +364,7 @@ def render_sidebar(session_id: str, store: Chroma | None) -> None:
                 else ""
             )
             st.markdown(
-                f'<div class="stat-card">✅ <b>{len(indexed_files)}</b> file(s) · '
+                f'<div class="stat-card">✅ <b>{len(indexed_files)}</b> source(s) · '
                 f'<b>{chunk_count:,}</b> chunks{timing_html}'
                 f'<div style="margin-top:0.4rem">{pills}</div></div>',
                 unsafe_allow_html=True,
@@ -319,12 +373,12 @@ def render_sidebar(session_id: str, store: Chroma | None) -> None:
             if indexed_files:
                 with st.expander("🗂️ Filter / Manage Files", expanded=False):
                     selected_scope = st.multiselect(
-                        "🎯 Scope Search to File(s)",
+                        "🎯 Scope Search to Source(s)",
                         options=indexed_files,
                         default=[f for f in bucket.get("active_files", []) if f in indexed_files],
                         key=f"scope_files_{session_id}",
-                        placeholder="All indexed files (default)",
-                        help="Select specific file(s) to restrict search, or leave empty to search all files.",
+                        placeholder="All indexed sources (default)",
+                        help="Select specific file(s) or URL(s) to restrict search, or leave empty to search all.",
                     )
                     if selected_scope != bucket.get("active_files", []):
                         bucket["active_files"] = selected_scope
@@ -332,12 +386,12 @@ def render_sidebar(session_id: str, store: Chroma | None) -> None:
 
                     st.markdown("---")
                     file_to_remove = st.selectbox(
-                        "Remove a Single File",
+                        "Remove a Single Source",
                         options=indexed_files,
                         key=f"del_file_select_{session_id}",
                     )
                     if st.button(
-                        "🗑️ Remove Selected File",
+                        "🗑️ Remove Selected Source",
                         use_container_width=True,
                         key=f"del_file_btn_{session_id}",
                     ):
@@ -358,8 +412,8 @@ def render_sidebar(session_id: str, store: Chroma | None) -> None:
             st.error("`GROQ_API_KEY` not found in `.env` file.")
 
         uploaded_files = st.file_uploader(
-            "Upload files (.xlsx, .xls, .csv, .pdf, .txt, .md)",
-            type=["xlsx", "xls", "csv", "pdf", "txt", "md"],
+            "Upload files (.xlsx, .xls, .csv, .pdf, .docx, .txt, .md)",
+            type=["xlsx", "xls", "csv", "pdf", "docx", "txt", "md"],
             accept_multiple_files=True,
             key=f"uploader_{session_id}_{st.session_state.uploader_key}",
             help=f"Up to {MAX_FILES} files, {MAX_FILE_MB} MB each.",
@@ -378,6 +432,24 @@ def render_sidebar(session_id: str, store: Chroma | None) -> None:
             use_container_width=True,
         ):
             process_documents_action(uploaded_files, session_id, append_mode=append_mode)
+
+        # Enterprise Website URL Ingestion UI
+        with st.expander("🌐 Add Website URLs", expanded=True):
+            raw_urls_text = st.text_area(
+                "Website URL(s) (one per line)",
+                placeholder="https://en.wikipedia.org/wiki/Cattle\nhttps://example.com/docs",
+                height=85,
+                key=f"url_input_{session_id}_{st.session_state.uploader_key}",
+                help="Paste one or more public webpage URLs to scrape and index into this session.",
+            )
+            parsed_urls = [u.strip() for u in raw_urls_text.splitlines() if u.strip()]
+            if st.button(
+                "🌐 Index Website URL(s)",
+                disabled=not parsed_urls or not api_key_ok,
+                use_container_width=True,
+                key=f"url_btn_{session_id}",
+            ):
+                process_urls_action(parsed_urls[:10], session_id, append_mode=append_mode)
 
         st.markdown("---")
         with st.expander("⚙️ Model & Search Settings", expanded=False):
@@ -430,7 +502,7 @@ def render_hero_header(session_id: str, ready: bool, store: Chroma | None) -> No
 
     bucket = _peek_bucket(session_id)
     active_files = bucket.get("active_files") or []
-    scope_note = f" · 🎯 Scoped to {len(active_files)} file(s)" if active_files else ""
+    scope_note = f" · 🎯 Scoped to {len(active_files)} source(s)" if active_files else ""
 
     st.markdown(
         f"""
@@ -599,7 +671,7 @@ def handle_user_question(question: str, session_id: str, store: Chroma) -> None:
                     use_mmr=use_mmr,
                     allowed_files=active_files,
                 )
-                scope_msg = f" (scoped to {len(active_files)} file(s))" if active_files else ""
+                scope_msg = f" (scoped to {len(active_files)} source(s))" if active_files else ""
                 status.update(
                     label=f"Found {len(sources)} relevant passages/rows{scope_msg}",
                     state="complete",
