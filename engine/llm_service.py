@@ -1,8 +1,8 @@
-# (Added _needs_contextual_rewrite() heuristic gatekeeper and rewrite_conversational_query() with automatic fallback)
 """
 Groq LLM Service Module.
-Handles live model discovery, conversational query rewriting, prompt message assembly,
-friendly error formatting, and auto-fallback streaming if a model returns 404 or is decommissioned.
+Handles live model discovery, conversational query rewriting, grounded follow-up
+question generation, prompt message assembly, friendly error formatting, and
+auto-fallback streaming if a model returns 404 or is decommissioned.
 """
 
 from __future__ import annotations
@@ -15,7 +15,11 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 
 from engine.config import FALLBACK_GROQ_MODELS, HISTORY_TURNS
-from prompts import QUERY_REWRITER_PROMPT, SYSTEM_PROMPT
+from prompts import (
+    FOLLOWUP_SUGGESTIONS_PROMPT,
+    QUERY_REWRITER_PROMPT,
+    SYSTEM_PROMPT,
+)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -61,11 +65,17 @@ def fetch_active_groq_models() -> list[str]:
     return models
 
 
+def _strip_thinking_tags(text: str) -> str:
+    """Remove <think>...</think> blocks emitted by reasoning models."""
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    return cleaned.strip()
+
+
 def _needs_contextual_rewrite(question: str, prior_messages: list) -> bool:
     """
     Stage 1 Gatekeeper (<0.1ms):
     Determines whether the user's question relies on prior conversation context.
-    Skips LLM rewriting for first turns or obvious standalone meta-questions.
     """
     if not prior_messages:
         return False
@@ -75,12 +85,10 @@ def _needs_contextual_rewrite(question: str, prior_messages: list) -> bool:
     if not words:
         return False
 
-    # Skip rewriting for session inventory meta-questions
     meta_phrases = ("how many files", "what files", "which files", "list all files", "uploaded files")
     if any(p in q_clean for p in meta_phrases):
         return False
 
-    # Trigger 1: Contains pronouns or demonstrative references that require resolution
     referential_pronouns = {
         "it", "its", "they", "them", "their", "theirs",
         "this", "that", "these", "those", "he", "she", "his", "her",
@@ -89,7 +97,6 @@ def _needs_contextual_rewrite(question: str, prior_messages: list) -> bool:
     if any(w in referential_pronouns for w in words):
         return True
 
-    # Trigger 2: Starts with conversational follow-up connectors
     followup_starters = (
         "what about", "how about", "and ", "also ", "why ", "how much",
         "how many", "what are the", "what is the", "can you", "tell me more",
@@ -98,7 +105,6 @@ def _needs_contextual_rewrite(question: str, prior_messages: list) -> bool:
     if any(q_clean.startswith(prefix) for prefix in followup_starters):
         return True
 
-    # Trigger 3: Short elliptical follow-up (<= 7 words)
     if len(words) <= 7:
         return True
 
@@ -108,17 +114,11 @@ def _needs_contextual_rewrite(question: str, prior_messages: list) -> bool:
 def rewrite_conversational_query(question: str, prior_messages: list) -> str:
     """
     Stage 2 Smart Conversational Query Rewriter:
-    Replaces the naive `<= 6 words` string concatenation with an intelligent,
-    context-aware LLM reformulation that resolves pronouns and implicit entities
-    while avoiding topic-switch pollution.
-
-    Returns:
-        A standalone search query string (or the original `question` if no rewrite is needed).
+    Resolves pronouns and implicit entities while avoiding topic-switch pollution.
     """
     if not _needs_contextual_rewrite(question, prior_messages):
         return question
 
-    # Extract the last 3 conversation turns (up to 6 messages) for compact, fast context
     valid_history = [m for m in prior_messages if not m.get("error") and m.get("content")][-6:]
     if not valid_history:
         return question
@@ -126,7 +126,6 @@ def rewrite_conversational_query(question: str, prior_messages: list) -> str:
     history_lines: list[str] = []
     for m in valid_history:
         role_label = "User" if m["role"] == "user" else "Assistant"
-        # Truncate long assistant answers to the first 300 chars to keep latency < 200ms
         snippet = m["content"][:300].replace("\n", " ")
         history_lines.append(f"{role_label}: {snippet}")
 
@@ -142,27 +141,129 @@ def rewrite_conversational_query(question: str, prior_messages: list) -> str:
         ),
     ]
 
-    # Prefer ultra-fast 8B instant model for query rewriting if available, else current model
     active_models = fetch_active_groq_models()
-    fast_candidates = [m for m in ("llama-3.1-8b-instant", st.session_state.get("selected_model", "")) if m]
+    fast_candidates = [
+        m for m in ("llama-3.1-8b-instant", "llama-3.3-70b-versatile", st.session_state.get("selected_model", ""))
+        if m
+    ]
     for m in active_models:
         if m not in fast_candidates:
             fast_candidates.append(m)
 
     for model_id in fast_candidates[:3]:
         try:
-            llm = ChatGroq(model=model_id, temperature=0.0, max_tokens=80, max_retries=1)
+            llm = ChatGroq(model=model_id, temperature=0.0, max_tokens=250, max_retries=1)
             resp = llm.invoke(rewrite_messages)
-            rewritten = (resp.content if isinstance(resp.content, str) else "").strip()
-            # Clean any accidental surrounding quotes or prefixes
-            rewritten = re.sub(r"^(standalone search query:|search query:|query:)\s*", "", rewritten, flags=re.I)
-            rewritten = rewritten.strip("\"'` \n")
+            raw_text = _strip_thinking_tags(resp.content if isinstance(resp.content, str) else "")
+            rewritten = re.sub(r"^(standalone search query:|search query:|query:)\s*", "", raw_text, flags=re.I)
+            rewritten = rewritten.strip("\"'` \n").splitlines()[0].strip() if rewritten.strip() else ""
             if rewritten and len(rewritten) >= 2:
                 return rewritten
         except Exception:
             continue
 
     return question
+
+
+def _build_deterministic_followups(sources: list[dict], all_files: list[str] | None = None) -> list[str]:
+    """
+    Guaranteed zero-latency fallback follow-up generator derived from the actual source filenames.
+    """
+    source_names: list[str] = []
+    for s in sources:
+        src = str(s.get("source") or "").split("|")[0].strip()
+        if src and src not in source_names:
+            source_names.append(src)
+
+    primary = source_names[0] if source_names else (all_files[0] if all_files else "this document")
+    short_primary = primary.rsplit(".", 1)[0][:28]
+
+    suggestions = [
+        f"What are the key details in {short_primary}?",
+        f"Summarize the main findings from {short_primary}?",
+    ]
+    if all_files and len(all_files) > 1:
+        other_files = [f for f in all_files if f != primary]
+        if other_files:
+            short_other = other_files[0].rsplit(".", 1)[0][:25]
+            suggestions.append(f"How does this compare with {short_other}?")
+        else:
+            suggestions.append("What specific facts or figures are mentioned?")
+    else:
+        suggestions.append("What specific facts or figures are mentioned?")
+
+    return suggestions[:3]
+
+
+def generate_followup_questions(
+    question: str,
+    answer: str,
+    sources: list[dict],
+    all_files: list[str] | None = None,
+) -> list[str]:
+    """
+    Enterprise Grounded Follow-Up Generator:
+    Generates 3 concise, clickable follow-up questions strictly grounded in the
+    retrieved `sources` and `all_files` inventory.
+    """
+    if not sources:
+        return []
+
+    snippets = [
+        f"[{s.get('source', 'doc')}]: {str(s.get('text', ''))[:260]}"
+        for s in sources[:4]
+    ]
+    files_line = f"Uploaded Files: {', '.join(all_files[:10])}\n" if all_files else ""
+    user_payload = (
+        f"{files_line}"
+        f"Source Passages:\n" + "\n".join(snippets) + "\n\n"
+        f"User Question: {question}\n"
+        f"Assistant Answer: {answer[:350]}\n\n"
+        "Output 3 short follow-up questions (one per line):"
+    )
+
+    messages = [
+        SystemMessage(content=FOLLOWUP_SUGGESTIONS_PROMPT),
+        HumanMessage(content=user_payload),
+    ]
+
+    active_models = fetch_active_groq_models()
+    fast_candidates = [
+        m
+        for m in (
+            "llama-3.1-8b-instant",
+            "llama-3.3-70b-versatile",
+            st.session_state.get("selected_model", ""),
+        )
+        if m
+    ]
+    for m in active_models:
+        if m not in fast_candidates:
+            fast_candidates.append(m)
+
+    for model_id in fast_candidates[:3]:
+        try:
+            llm = ChatGroq(model=model_id, temperature=0.2, max_tokens=350, max_retries=1)
+            resp = llm.invoke(messages)
+            raw = _strip_thinking_tags(resp.content if isinstance(resp.content, str) else "")
+            lines: list[str] = []
+            for line in raw.splitlines():
+                cleaned = re.sub(r"^[\d\-\*\•\.\)\s]+", "", line).strip().strip("\"'`")
+                if not cleaned or len(cleaned) < 8:
+                    continue
+                if cleaned.lower().startswith(("here are", "sure", "follow-up", "questions:")):
+                    continue
+                if not cleaned.endswith("?"):
+                    cleaned += "?"
+                lines.append(cleaned[:85])
+                if len(lines) == 3:
+                    break
+            if len(lines) >= 2:
+                return lines[:3]
+        except Exception:
+            continue
+
+    return _build_deterministic_followups(sources, all_files)
 
 
 def build_messages(prior_messages: list, question: str, context: str) -> list:

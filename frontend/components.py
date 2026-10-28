@@ -1,13 +1,6 @@
-# Update frontend/components.py (Wire in rewrite_conversational_query + UI Telemetry)
-# In frontend/components.py, we simply:
-
-# Import rewrite_conversational_query from engine.llm_service.
-# Replace the old 4-line if len(question.split()) <= 6: block inside handle_user_question() with search_query = rewrite_conversational_query(question, prior_messages).
-# Display a subtle caption when a follow-up question was rewritten (e.g., 🔄 Rewritten query: "What are the cultural roles of the cow in Hinduism?").
-
 """
 Separated Frontend UI Components Module.
-Renders Sidebar, Hero Banner, Source Citations, and Interactive Chat Interface.
+Renders Sidebar, Hero Banner, Source Citations, Suggested Follow-Ups, and Interactive Chat Interface.
 
 Key Architectural Features:
 ---------------------------
@@ -22,9 +15,9 @@ Key Architectural Features:
 4. Smart Conversational Query Rewriter:
    Replaces naive word-count concatenation with an LLM-powered coreference & entity resolver
    for multi-turn follow-up questions.
-5. Smart Irrelevant-Source Suppression:
-   Automatically hides source citations when the assistant indicates the requested topic
-   was not found in the uploaded documents.
+5. Grounded Auto-Generated Follow-Up Suggestions (`render_followup_pills`):
+   Generates 3 clickable follow-up question buttons below the latest answer grounded in the
+   retrieved source passages.
 """
 
 from __future__ import annotations
@@ -45,6 +38,7 @@ from engine.llm_service import (
     build_messages,
     fetch_active_groq_models,
     friendly_error,
+    generate_followup_questions,
     rewrite_conversational_query,
     stream_with_auto_fallback,
 )
@@ -540,8 +534,33 @@ def render_sources(sources: list[dict]) -> None:
             )
 
 
+def render_followup_pills(followups: list[str], msg_idx: int, session_id: str) -> str | None:
+    """
+    Render 3 clickable follow-up question buttons underneath the latest assistant response.
+    Returns the clicked question text (if clicked by the user) so `main.py` can execute it.
+    """
+    if not followups:
+        return None
+
+    st.markdown(
+        '<div style="font-size:0.8rem;color:#94a3b8;margin:0.35rem 0 0.25rem 0;">'
+        "💡 <b>Suggested follow-ups:</b></div>",
+        unsafe_allow_html=True,
+    )
+    cols = st.columns(len(followups))
+    clicked_question: str | None = None
+    for idx, q_text in enumerate(followups):
+        if cols[idx].button(
+            f"↪ {q_text}",
+            key=f"followup_{session_id}_{msg_idx}_{idx}",
+            use_container_width=True,
+        ):
+            clicked_question = q_text
+    return clicked_question
+
+
 def handle_user_question(question: str, session_id: str, store: Chroma) -> None:
-    """Execute Smart Query Rewriting, Phase 5 Hybrid Search, and stream the LLM answer."""
+    """Execute Smart Query Rewriting, Phase 5 Hybrid Search, stream LLM answer, and generate follow-ups."""
     clean_q = question.lower().strip()
     if clean_q in ["delete session", "delete this session", "clear session", "/delete"]:
         delete_session_action(session_id)
@@ -561,11 +580,11 @@ def handle_user_question(question: str, session_id: str, store: Chroma) -> None:
     errored = False
     active_files = bucket.get("active_files") or None
     rewritten_query: str | None = None
+    followups: list[str] = []
 
     with st.chat_message("assistant"):
         with st.status("🔎 Searching your documents (Categorical + FTS5 + Vector)…", expanded=False) as status:
             try:
-                # Stage 0: Smart Conversational Query Rewriter (resolves pronouns & follow-up context)
                 search_query = rewrite_conversational_query(question, prior_messages)
                 if search_query.strip().lower() != question.strip().lower():
                     rewritten_query = search_query
@@ -637,6 +656,9 @@ def handle_user_question(question: str, session_id: str, store: Chroma) -> None:
 
         if _is_not_found_answer(answer):
             sources = []
+        elif not errored and sources:
+            all_files_list = bucket.get("indexed_files") or []
+            followups = generate_followup_questions(question, answer, sources, all_files_list)
 
         elapsed = time.time() - started
         if not errored:
@@ -649,8 +671,12 @@ def handle_user_question(question: str, session_id: str, store: Chroma) -> None:
             "role": "assistant",
             "content": answer,
             "sources": [] if errored else sources,
+            "followups": followups,
+            "rewritten_query": rewritten_query,
             "error": errored,
             "elapsed": elapsed,
         }
     )
     save_disk_metadata()
+    if followups:
+        st.rerun()
