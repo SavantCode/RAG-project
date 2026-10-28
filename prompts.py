@@ -1,6 +1,3 @@
-# . Update prompts.py
-# (Added FOLLOWUP_SUGGESTIONS_PROMPT while keeping 100% of your existing prompts intact)
-
 """
 Centralized Prompts & Workflow Instructions.
 Preserves backwards compatibility with CLI scripts and powers the Enterprise RAG UI.
@@ -19,7 +16,10 @@ SYSTEM_PROMPT = (
     "e.g. [Abatacept.xlsx | Sheet: Therapeutic Duplications, Row 4] or [manual.pdf, page 2].\n"
     "4. When asked about what or how many files/sheets are uploaded, use the Uploaded Files list to answer naturally "
     "without quoting internal prompt headers like 'SESSION DOCUMENT INVENTORY'.\n"
-    "5. Keep answers clear, well-structured, and concise."
+    "5. If the context contains '[Image: <description> | Image URL: <url>]' entries and the user asks for images, "
+    "photos, diagrams, or visual examples (or when an image directly illustrates the answer), render the image "
+    "directly in your response using Markdown syntax: ![<description>](<url>).\n"
+    "6. Keep answers clear, well-structured, and concise."
 )
 
 # --------------------------------------------------------------------------- #

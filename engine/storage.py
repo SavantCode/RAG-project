@@ -1,9 +1,12 @@
-# 3. Update engine/storage.py
-# (Upgraded hybrid_retrieve() with Multi-Signal Fusion so if a chunk matches FTS5 + Vector + Category, all badges and the exact Vector similarity % are combined onto the same source card!)
+# 2. Update _StdLibHTMLTextExtractor & parse_url_to_chunks in engine/storage.py
+# Replace lines 45–88 (_StdLibHTMLTextExtractor) and parse_url_to_chunks in engine/storage.py, OR simply copy and replace your entire engine/storage.py with the complete updated file below (Ctrl + S):
+
+
 
 """
 Phase 3 & Phase 5: ChromaDB Vector Storage, Streaming Micro-Batch Ingestion,
-Session State Persistence, Per-File Management, and High-Precision Hybrid Search.
+Website URL (Text + Image) & DOCX Ingestion, Session State Persistence,
+Per-File Management, and High-Precision Hybrid Search.
 """
 
 from __future__ import annotations
@@ -11,17 +14,25 @@ from __future__ import annotations
 import gc
 import hashlib
 import html
+import io
 import json
 import os
+import re
 import shutil
 import time
+import xml.etree.ElementTree as ET
+import zipfile
+from html.parser import HTMLParser
 from typing import Callable
+from urllib.parse import urljoin, urlparse
 
 import chromadb
+import requests
 import streamlit as st
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from engine.config import (
     BASE_CHROMA_DIR,
@@ -42,6 +53,102 @@ from engine.hybrid_index import (
 )
 from excelreader import parse_excel_or_csv_bytes
 from filereader import parse_pdf_bytes, parse_text_or_md_bytes
+
+
+class _StdLibHTMLTextExtractor(HTMLParser):
+    """
+    Zero-dependency HTML text, title, and image extractor using Python's built-in `html.parser`.
+    - Strips <script>, <style>, <nav>, <footer>, <header>, <aside>, and <svg> blocks.
+    - Extracts meaningful <img> tags (resolving relative URLs to absolute https:// URLs and
+      filtering out tiny UI icons/trackers) so RAG can search and render images from web pages.
+    """
+
+    SKIP_TAGS = {"script", "style", "noscript", "nav", "footer", "header", "aside", "form", "svg"}
+    BLOCK_TAGS = {
+        "p", "div", "section", "article", "li", "tr",
+        "h1", "h2", "h3", "h4", "h5", "h6", "br", "figcaption",
+    }
+    JUNK_IMG_PATTERNS = ("icon", "logo", "sprite", "pixel", "avatar", "banner", "button", "1x1", ".svg")
+
+    def __init__(self, base_url: str = "") -> None:
+        super().__init__()
+        self.base_url = base_url
+        self._skip_depth = 0
+        self._in_title = False
+        self.title_parts: list[str] = []
+        self.text_parts: list[str] = []
+        self.images: list[dict[str, str]] = []
+        self._seen_img_urls: set[str] = set()
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        t = tag.lower()
+        if t in self.SKIP_TAGS:
+            self._skip_depth += 1
+            return
+        if t == "title":
+            self._in_title = True
+            return
+        if self._skip_depth > 0:
+            return
+
+        if t in self.BLOCK_TAGS:
+            self.text_parts.append("\n")
+        elif t == "img":
+            attr_map = {k.lower(): (v or "").strip() for k, v in attrs if k}
+            raw_src = (
+                attr_map.get("src")
+                or attr_map.get("data-src")
+                or attr_map.get("data-original")
+                or ""
+            )
+            if not raw_src or raw_src.startswith("data:"):
+                return
+
+            full_img_url = urljoin(self.base_url, raw_src) if self.base_url else raw_src
+            if not full_img_url.startswith(("http://", "https://")):
+                return
+
+            lower_url = full_img_url.lower()
+            if any(junk in lower_url for junk in self.JUNK_IMG_PATTERNS):
+                return
+
+            # Filter out tiny 1x1 or icon dimensions when width/height attributes are present
+            w_str = re.sub(r"[^\d]", "", attr_map.get("width", ""))
+            h_str = re.sub(r"[^\d]", "", attr_map.get("height", ""))
+            if (w_str and int(w_str) < 48) or (h_str and int(h_str) < 48):
+                return
+
+            alt_text = (attr_map.get("alt") or attr_map.get("title") or "").strip()
+            if not alt_text:
+                # Derive readable label from image filename if alt attribute was empty
+                fname = urlparse(full_img_url).path.rsplit("/", 1)[-1]
+                fname_clean = re.sub(r"[\-_\.]+", " ", fname.rsplit(".", 1)[0]).strip()
+                alt_text = fname_clean if len(fname_clean) >= 3 else "Webpage illustration"
+
+            if full_img_url not in self._seen_img_urls:
+                self._seen_img_urls.add(full_img_url)
+                self.images.append({"alt": alt_text[:120], "url": full_img_url})
+                # Inject searchable image marker inline with the surrounding paragraph text
+                self.text_parts.append(
+                    f"\n[Image: {alt_text[:120]} | Image URL: {full_img_url}]\n"
+                )
+
+    def handle_endtag(self, tag: str) -> None:
+        t = tag.lower()
+        if t in self.SKIP_TAGS and self._skip_depth > 0:
+            self._skip_depth -= 1
+        elif t == "title":
+            self._in_title = False
+        elif t in self.BLOCK_TAGS and self._skip_depth == 0:
+            self.text_parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._in_title:
+            self.title_parts.append(data)
+        elif self._skip_depth == 0:
+            cleaned = data.strip()
+            if cleaned:
+                self.text_parts.append(cleaned + " ")
 
 
 # --------------------------------------------------------------------------- #
@@ -158,10 +265,7 @@ def get_session_vector_store(session_id: str) -> Chroma | None:
 
 
 def extract_indexed_filenames(store: Chroma | None, session_id: str | None = None) -> list[str]:
-    """
-    Read unique filenames from both SQLite Hybrid DB (unlimited rows, O(1) index scan)
-    and ChromaDB metadata so 10+ large Excel files are never truncated.
-    """
+    """Read unique filenames / URLs from both SQLite Hybrid DB and ChromaDB metadata."""
     names: set[str] = set()
 
     if session_id:
@@ -185,7 +289,6 @@ def extract_indexed_filenames(store: Chroma | None, session_id: str | None = Non
 
 def delete_single_file_from_session(session_id: str, file_name: str) -> int:
     """
-    Improvement (Granular Document Management):
     Deletes all vector embeddings and FTS5/Categorical rows belonging to `file_name`
     inside `session_id` without wiping the rest of the session's knowledge base.
     """
@@ -245,6 +348,183 @@ def wipe_session_data(session_id: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Enterprise DOCX & Website URL Parsers (100% StdLib — Text + Image Extraction!)
+# --------------------------------------------------------------------------- #
+def parse_docx_bytes(file_name: str, raw_data: bytes, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP) -> list[Document]:
+    """
+    Enterprise Zero-Dependency DOCX Parser:
+    Extracts both paragraphs (`<w:p>`) and structured tables (`<w:tbl>`) directly from
+    the OpenXML (`word/document.xml`) archive using Python's built-in `zipfile` + `ElementTree`.
+    """
+    blocks: list[str] = []
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw_data)) as zf:
+            if "word/document.xml" not in zf.namelist():
+                raise ValueError("Invalid .docx file (missing word/document.xml).")
+            xml_bytes = zf.read("word/document.xml")
+
+        root = ET.fromstring(xml_bytes)
+        body = root.find("w:body", ns)
+        elements = list(body) if body is not None else list(root)
+
+        for elem in elements:
+            tag = elem.tag.rsplit("}", 1)[-1]
+            if tag == "p":
+                texts = [t.text for t in elem.findall(".//w:t", ns) if t.text]
+                para = "".join(texts).strip()
+                if para:
+                    blocks.append(para)
+            elif tag == "tbl":
+                table_rows: list[str] = []
+                for row in elem.findall(".//w:tr", ns):
+                    cells: list[str] = []
+                    for cell in row.findall(".//w:tc", ns):
+                        c_texts = [t.text for t in cell.findall(".//w:t", ns) if t.text]
+                        c_val = " ".join("".join(c_texts).split())
+                        if c_val:
+                            cells.append(c_val)
+                    if cells:
+                        table_rows.append(" | ".join(cells))
+                if table_rows:
+                    blocks.append("\n".join(table_rows))
+    except Exception as exc:
+        raise ValueError(f"Could not read DOCX file '{file_name}': {exc}") from exc
+
+    full_text = "\n\n".join(blocks).strip()
+    if not full_text:
+        raise ValueError(f"No readable text found inside '{file_name}'.")
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    raw_chunks = splitter.split_text(full_text)
+
+    docs: list[Document] = []
+    for idx, text_chunk in enumerate(raw_chunks, start=1):
+        docs.append(
+            Document(
+                page_content=f"[Document: {file_name} | Section {idx}]\n{text_chunk}",
+                metadata={
+                    "source": file_name,
+                    "file_name": file_name,
+                    "page": idx,
+                    "sheet_name": f"section_{idx}",
+                },
+            )
+        )
+    return docs
+
+
+def parse_url_to_chunks(url: str, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP) -> tuple[str, list[Document]]:
+    """
+    Enterprise Website URL Scraper & Chunker (Text + Embedded Images):
+    - Supports direct image URLs (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`) as well as HTML pages.
+    - Extracts clean article text AND inline `[Image: <alt> | Image URL: <https_url>]` markers
+      plus a dedicated Image Catalog chunk so image queries always retrieve matching visuals.
+    """
+    clean_url = url.strip()
+    if not clean_url.startswith(("http://", "https://")):
+        clean_url = "https://" + clean_url
+
+    parsed = urlparse(clean_url)
+    if not parsed.netloc:
+        raise ValueError(f"Invalid URL: {url}")
+
+    path_slug = parsed.path.strip("/")[:28]
+    display_source = f"🌐 {parsed.netloc}/{path_slug}".rstrip("/")
+
+    # Handle direct image URLs (e.g., https://example.com/diagram.png)
+    if parsed.path.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+        img_name = parsed.path.rsplit("/", 1)[-1]
+        doc = Document(
+            page_content=(
+                f"[Web Source: {display_source} | Direct Image]\n"
+                f"[Image: {img_name} | Image URL: {clean_url}]"
+            ),
+            metadata={
+                "source": display_source,
+                "file_name": display_source,
+                "url": clean_url,
+                "page": 1,
+                "sheet_name": "web_images",
+            },
+        )
+        return display_source, [doc]
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+    resp = requests.get(clean_url, headers=headers, timeout=15)
+    resp.raise_for_status()
+
+    extractor = _StdLibHTMLTextExtractor(base_url=clean_url)
+    extractor.feed(resp.text)
+
+    page_title = " ".join("".join(extractor.title_parts).split()).strip() or parsed.netloc
+    raw_text = "".join(extractor.text_parts)
+
+    lines = [re.sub(r"\s+", " ", line).strip() for line in raw_text.splitlines()]
+    lines = [line for line in lines if len(line) > 1]
+    cleaned_body = "\n".join(lines)
+
+    if len(cleaned_body) < 40 and not extractor.images:
+        raise ValueError("Page contained too little readable text (may require JavaScript login).")
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    text_splits = splitter.split_text(cleaned_body) if cleaned_body else []
+
+    docs: list[Document] = []
+    for idx, chunk_str in enumerate(text_splits, start=1):
+        docs.append(
+            Document(
+                page_content=(
+                    f"[Web Source: {display_source} | Title: {page_title} | URL: {clean_url} | Part {idx}]\n"
+                    f"{chunk_str}"
+                ),
+                metadata={
+                    "source": display_source,
+                    "file_name": display_source,
+                    "url": clean_url,
+                    "page": idx,
+                    "sheet_name": "web_page",
+                },
+            )
+        )
+
+    # Also create a dedicated Visual / Image Gallery Catalog chunk (up to 15 top images on the page)
+    # so questions like "show me images/photos/diagrams from this page" always match via FTS5 & Vector!
+    if extractor.images:
+        gallery_lines = [
+            f"- [Image: {img['alt']} | Image URL: {img['url']}]"
+            for img in extractor.images[:15]
+        ]
+        gallery_chunk = (
+            f"[Web Source: {display_source} | Title: {page_title} | Image Gallery & Visual Figures]\n"
+            f"Images, photos, diagrams, and illustrations found on {page_title} ({clean_url}):\n"
+            + "\n".join(gallery_lines)
+        )
+        docs.append(
+            Document(
+                page_content=gallery_chunk,
+                metadata={
+                    "source": display_source,
+                    "file_name": display_source,
+                    "url": clean_url,
+                    "page": len(docs) + 1,
+                    "sheet_name": "web_images",
+                },
+            )
+        )
+
+    return display_source, docs
+
+
+# --------------------------------------------------------------------------- #
 # Modular File Router & Phase 3 Streaming Micro-Batch Ingestion
 # --------------------------------------------------------------------------- #
 def route_uploaded_file_to_chunks(uploaded_file) -> list[Document]:
@@ -252,6 +532,7 @@ def route_uploaded_file_to_chunks(uploaded_file) -> list[Document]:
     Dispatch uploaded file by extension to its dedicated parser module:
       - .xlsx, .xls, .csv -> excelreader.py (Polars + Calamine + 1-Row-Per-Chunk)
       - .pdf              -> filereader.py  (parse_pdf_bytes)
+      - .docx             -> storage.py     (parse_docx_bytes - paragraphs + tables)
       - .txt, .md         -> filereader.py  (parse_text_or_md_bytes)
     Ensures every chunk carries `file_name` metadata for per-file filtering and deletion.
     """
@@ -269,6 +550,8 @@ def route_uploaded_file_to_chunks(uploaded_file) -> list[Document]:
         chunks = parse_excel_or_csv_bytes(name, raw_data)
     elif suffix == "pdf":
         chunks = parse_pdf_bytes(name, raw_data, chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    elif suffix == "docx":
+        chunks = parse_docx_bytes(name, raw_data, chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
     elif suffix in ("txt", "md"):
         chunks = parse_text_or_md_bytes(name, raw_data, chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
     else:
@@ -289,11 +572,7 @@ def ingest_files_with_micro_batches(
     log_fn: Callable[[str], None],
     progress_fn: Callable[[float, str], None],
 ) -> dict:
-    """
-    Phase 3: Streaming Micro-Batch Architecture.
-    Takes groups of MICRO_BATCH_SIZE (250) rows/chunks at a time, embeds them,
-    and immediately commits them to ChromaDB + Dual-Layer Hybrid DB to protect RAM.
-    """
+    """Phase 3: Streaming Micro-Batch Architecture for Uploaded Files."""
     started = time.time()
     embeddings = get_embeddings()
     client = get_chroma_client()
@@ -365,13 +644,87 @@ def ingest_files_with_micro_batches(
     }
 
 
+def ingest_urls_with_micro_batches(
+    urls: list[str],
+    session_id: str,
+    append_mode: bool,
+    log_fn: Callable[[str], None],
+    progress_fn: Callable[[float, str], None],
+) -> dict:
+    """Phase 3: Streaming Micro-Batch Architecture for Live Website URLs (Text + Images)."""
+    started = time.time()
+    embeddings = get_embeddings()
+    client = get_chroma_client()
+    collection_name = f"session_{session_id}"
+
+    if not append_mode:
+        wipe_session_data(session_id)
+
+    store = Chroma(
+        client=client,
+        collection_name=collection_name,
+        embedding_function=embeddings,
+    )
+
+    good_sources: list[str] = []
+    failed: list[str] = []
+    total_urls = len(urls)
+    committed_chunks = 0
+
+    batch_docs: list[Document] = []
+    batch_ids: list[str] = []
+    seen_ids: set[str] = set()
+
+    def _flush_micro_batch() -> None:
+        nonlocal committed_chunks
+        if not batch_docs:
+            return
+        store.add_documents(documents=list(batch_docs), ids=list(batch_ids))
+        index_micro_batch_into_hybrid_db(session_id, list(batch_docs), list(batch_ids))
+        committed_chunks += len(batch_docs)
+        batch_docs.clear()
+        batch_ids.clear()
+
+    for u_idx, raw_url in enumerate(urls, start=1):
+        try:
+            display_source, url_chunks = parse_url_to_chunks(raw_url)
+            good_sources.append(display_source)
+            log_fn(f"✅ **{html.escape(display_source)}** ({len(url_chunks):,} web & image chunks)")
+
+            for c_idx, chunk in enumerate(url_chunks):
+                cid = hashlib.sha256(
+                    f"{display_source}_{c_idx}_{chunk.page_content[:140]}".encode("utf-8")
+                ).hexdigest()[:24]
+
+                if cid not in seen_ids:
+                    seen_ids.add(cid)
+                    batch_docs.append(chunk)
+                    batch_ids.append(cid)
+
+                if len(batch_docs) >= MICRO_BATCH_SIZE:
+                    _flush_micro_batch()
+                    progress_fn(
+                        min(1.0, u_idx / total_urls),
+                        f"Streamed {committed_chunks:,} web chunks to DB ({u_idx}/{total_urls} URLs)…",
+                    )
+        except Exception as exc:
+            failed.append(f"{raw_url}: {exc}")
+            log_fn(f"⚠️ **{html.escape(raw_url)}** failed — {exc}")
+
+    _flush_micro_batch()
+    elapsed = time.time() - started
+
+    return {
+        "store": store,
+        "good_files": good_sources,
+        "chunks": store._collection.count(),
+        "seconds": elapsed,
+        "failed": failed,
+    }
+
+
 def _build_source_badges(item: dict) -> list[dict[str, str]]:
-    """
-    Construct the list of structured, color-coded badge descriptors for a retrieved chunk:
-      - 🏷️ Exact Category Match (badge-category)
-      - 🔤 FTS5 Keyword Match   (badge-fts)
-      - 🧠 Semantic Vector (X%) (badge-vector)
-    """
+    """Construct the list of structured, color-coded badge descriptors for a retrieved chunk."""
     badges: list[dict[str, str]] = []
     if item.get("matched_category"):
         badges.append({"label": "🏷️ Exact Category Match", "css": "badge-category"})
@@ -395,15 +748,7 @@ def hybrid_retrieve(
     use_mmr: bool = True,
     allowed_files: list[str] | None = None,
 ) -> list[dict]:
-    """
-    Phase 5 Enterprise Multi-Stage Hybrid Search:
-      - Step 1 (Categorical B-Tree Hard Filter): Narrows pool by `medicine_name` & `sheet_name`.
-      - Step 2 (SQLite FTS5 Keyword Search): BM25 ranking for exact clinical terms & IDs.
-      - Step 3 (Chroma Semantic Vector Search): MMR or Similarity search with score lookup.
-      - Step 4 (Multi-Signal Attribution Fusion): If a chunk is retrieved by BOTH FTS5 and Vector
-        search, fuses their attribution flags onto a single source entry and computes color-coded
-        pill badges (`🏷️ Exact Category Match`, `🔤 FTS5 Keyword Match`, `🧠 Semantic Vector (84%)`).
-    """
+    """Phase 5 Enterprise Multi-Stage Hybrid Search."""
     detected = detect_categorical_filters(session_id, question, allowed_files=allowed_files)
     med_filter = detected.get("medicine_name")
     sheet_filter = detected.get("sheet_name")
@@ -425,7 +770,6 @@ def hybrid_retrieve(
     elif len(conditions) > 1:
         chroma_where = {"$and": conditions}
 
-    # Stage 2: FTS5 Keyword Search (BM25)
     fts_hits = search_fts_keywords(
         session_id=session_id,
         question=question,
@@ -435,8 +779,6 @@ def hybrid_retrieve(
         allowed_files=allowed_files,
     )
 
-    # Stage 3: Scoped Semantic Vector Search
-    # Also fetch similarity scores in a fast lookup map so MMR results still get an exact % score!
     score_lookup: dict[str, int] = {}
     try:
         scored_pairs = store.similarity_search_with_score(
@@ -462,7 +804,6 @@ def hybrid_retrieve(
     except Exception:
         vector_results = []
 
-    # Fallback: If hard categorical filter yielded 0 vector hits, relax categorical filter
     if not vector_results and chroma_where is not None:
         used_cat_filter = False
         file_only_where: dict | None = None
@@ -492,14 +833,12 @@ def hybrid_retrieve(
             fallback_docs = store.similarity_search(question, k=top_k)
             vector_results = [(d, None) for d in fallback_docs]
 
-    # Stage 4: Multi-Signal Attribution Fusion (Merge FTS5 + Vector + Categorical signals)
     merged_by_sig: dict[str, dict] = {}
     ordered_sigs: list[str] = []
 
     for hit in fts_hits:
         sig = hit["text"][:200]
         if sig not in merged_by_sig:
-            # Attach similarity % if Chroma also scored this chunk
             hit["match_pct"] = score_lookup.get(sig)
             merged_by_sig[sig] = hit
             ordered_sigs.append(sig)
@@ -513,7 +852,6 @@ def hybrid_retrieve(
         )
 
         if sig in merged_by_sig:
-            # Chunk was already found by FTS5! Fuse the Vector signal onto the existing entry
             existing = merged_by_sig[sig]
             existing["matched_vector"] = True
             existing["matched_category"] = existing.get("matched_category") or used_cat_filter
@@ -531,7 +869,6 @@ def hybrid_retrieve(
             }
             ordered_sigs.append(sig)
 
-    # Finalize structured badges list for each source card
     final_sources: list[dict] = []
     for sig in ordered_sigs[:top_k]:
         item = merged_by_sig[sig]
