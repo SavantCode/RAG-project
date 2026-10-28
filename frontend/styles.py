@@ -5,7 +5,13 @@ import streamlit as st
 
 
 def apply_dashboard_theme() -> None:
-    """Apply sleek dark slate & indigo dashboard styling."""
+    """
+    Apply sleek dark slate & indigo dashboard styling.
+    Includes enterprise color-coded pill badges for 3-Layer Hybrid Search attribution:
+      - .badge-category (Emerald): B-Tree Categorical Hard Filter Match
+      - .badge-fts      (Amber)  : SQLite FTS5 BM25 Exact Keyword Match
+      - .badge-vector   (Indigo) : ChromaDB Dense Semantic Vector Match
+    """
     st.markdown(
         """
         <style>
@@ -133,10 +139,64 @@ def apply_dashboard_theme() -> None:
         }
         .source-card {
             border: 1px solid var(--border);
-            border-radius: 10px;
-            padding: 0.7rem 0.95rem;
+            border-radius: 12px;
+            padding: 0.8rem 1rem;
             background: var(--surface);
-            margin-bottom: 0.55rem;
+            margin-bottom: 0.6rem;
+        }
+        .source-header {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.45rem;
+            margin-bottom: 0.35rem;
+        }
+        .source-badges {
+            display: inline-flex;
+            flex-wrap: wrap;
+            gap: 0.35rem;
+            align-items: center;
+        }
+        /* Color-Coded 3-Layer Hybrid Search Pill Badges */
+        .match-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.16rem 0.58rem;
+            border-radius: 999px;
+            font-size: 0.74rem;
+            font-weight: 700;
+            letter-spacing: 0.01em;
+            white-space: nowrap;
+        }
+        .badge-category {
+            background: rgba(16, 185, 129, 0.14);
+            border: 1px solid rgba(16, 185, 129, 0.45);
+            color: #34d399;
+        }
+        .badge-fts {
+            background: rgba(245, 158, 11, 0.14);
+            border: 1px solid rgba(245, 158, 11, 0.45);
+            color: #fbbf24;
+        }
+        .badge-vector {
+            background: rgba(99, 102, 241, 0.16);
+            border: 1px solid rgba(129, 140, 248, 0.45);
+            color: #a5b4fc;
+        }
+        .hybrid-summary-bar {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 0.8rem;
+            margin-bottom: 0.65rem;
+            border-radius: 10px;
+            background: var(--surface-2);
+            border: 1px solid var(--border);
+            font-size: 0.8rem;
+            color: #cbd5e1;
         }
         .source-snippet { color: var(--muted); font-size: .84rem; white-space: pre-wrap; margin-top: 0.3rem; }
         </style>

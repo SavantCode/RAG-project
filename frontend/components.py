@@ -10,18 +10,18 @@ Key Architectural Features:
 2. Per-File Scope Filtering & Granular Deletion:
    Allows users to restrict RAG retrieval to specific documents inside a session or remove
    individual files without wiping the entire session.
-3. Transparent Hybrid Retrieval Badges:
-   Displays whether each source chunk was matched via FTS5 Keyword, Categorical B-Tree, or Vector MMR.
-4. Full Session Document Inventory Manifest:
-   Injects the complete list of all indexed filenames, chunk counts, and spreadsheet tabs
-   into the LLM context header so meta-questions (e.g., "How many files do you have?")
-   are answered with 100% accuracy regardless of Top-K limits.
+3. Enterprise Color-Coded Hybrid Retrieval Badges:
+   Displays a Hybrid Retrieval Breakdown bar and color-coded pills (Categorical, FTS5, Vector).
+4. Smart Irrelevant-Source Suppression:
+   Automatically hides source citations when the assistant indicates the requested topic
+   was not found in the uploaded documents (e.g., out-of-scope queries like "butterfly" or "hij").
 """
 
 from __future__ import annotations
 
 import html
 import os
+import re
 import time
 import uuid
 from datetime import datetime
@@ -63,7 +63,7 @@ def ensure_session_bucket(session_id: str) -> dict:
             "name": "",
             "messages": [],
             "indexed_files": restored_files,
-            "active_files": [],  # Empty list means "search all files in session"
+            "active_files": [],
             "index_stats": None,
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
@@ -75,7 +75,6 @@ def ensure_session_bucket(session_id: str) -> dict:
             bucket["active_files"] = []
         if restored_files:
             bucket["indexed_files"] = restored_files
-            # Prune any active_files filter entries that no longer exist
             bucket["active_files"] = [f for f in bucket["active_files"] if f in restored_files]
     return st.session_state.session_data[session_id]
 
@@ -128,6 +127,23 @@ def get_session_display_name(session_id: str) -> str:
     if not custom_name and not files:
         return f"#{session_id}"
     return f"{get_session_base_label(session_id)} (#{session_id})"
+
+
+def _is_not_found_answer(answer: str) -> bool:
+    """
+    Detect if the LLM explicitly stated that the answer was not found in the documents.
+    Used to suppress misleading low-similarity source citations on out-of-scope queries.
+    """
+    lower = answer.lower()
+    not_found_patterns = (
+        r"could not find",
+        r"couldn't find",
+        r"not mentioned in the (uploaded |provided )?documents",
+        r"no information about",
+        r"does not contain (any )?information",
+        r"not present in the (uploaded |provided )?context",
+    )
+    return any(re.search(pat, lower) for pat in not_found_patterns)
 
 
 def delete_session_action(session_id: str) -> None:
@@ -295,7 +311,6 @@ def render_sidebar(session_id: str, store: Chroma | None) -> None:
                 unsafe_allow_html=True,
             )
 
-            # Improvement: Per-File Scope Filter & Single-File Deletion UI
             if indexed_files:
                 with st.expander("🗂️ Filter / Manage Files", expanded=False):
                     selected_scope = st.multiselect(
@@ -410,11 +425,7 @@ def render_hero_header(session_id: str, ready: bool, store: Chroma | None) -> No
 
     bucket = _peek_bucket(session_id)
     active_files = bucket.get("active_files") or []
-    scope_note = (
-        f" · 🎯 Scoped to {len(active_files)} file(s)"
-        if active_files
-        else ""
-    )
+    scope_note = f" · 🎯 Scoped to {len(active_files)} file(s)" if active_files else ""
 
     st.markdown(
         f"""
@@ -438,32 +449,81 @@ def render_hero_header(session_id: str, ready: bool, store: Chroma | None) -> No
 
 def render_sources(sources: list[dict]) -> None:
     """
-    Render expandable source citation cards with escaped HTML and Hybrid Retrieval Match Badges.
-    Shows whether a passage came from FTS5 Keyword Search, Categorical Filter, or Vector Search.
+    Render expandable source citation cards with:
+      1. A Hybrid Search Telemetry Bar summarizing how many sources matched each engine layer.
+      2. Color-coded pill badges on every source card:
+         - 🏷️ Exact Category Match (Emerald Green)
+         - 🔤 FTS5 Keyword Match   (Amber Gold)
+         - 🧠 Semantic Vector (X%) (Indigo Purple)
     """
     if not sources:
         return
-    with st.expander(f"📚 Sources ({len(sources)})"):
+
+    with st.expander(f"📚 Sources & Hybrid Attribution ({len(sources)})"):
+        # Compute per-layer match counts (supports both structured badges and legacy match_type strings)
+        cat_count = sum(
+            1
+            for s in sources
+            if s.get("matched_category") or "Categorical" in str(s.get("match_type", ""))
+        )
+        fts_count = sum(
+            1
+            for s in sources
+            if s.get("matched_fts") or "FTS5" in str(s.get("match_type", ""))
+        )
+        vec_count = sum(
+            1
+            for s in sources
+            if s.get("matched_vector")
+            or "Vector" in str(s.get("match_type", ""))
+            or (not s.get("badges") and not s.get("match_type"))
+        )
+
+        st.markdown(
+            f"""
+            <div class="hybrid-summary-bar">
+                <b>⚡ Hybrid Retrieval Breakdown:</b>
+                <span class="match-badge badge-category">🏷️ Categorical Filter: {cat_count}</span>
+                <span class="match-badge badge-fts">🔤 FTS5 Keyword: {fts_count}</span>
+                <span class="match-badge badge-vector">🧠 Semantic Vector: {vec_count}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
         for idx, s in enumerate(sources, start=1):
             safe_source = html.escape(str(s.get("source", "unknown")))
             page_str = f", row/page {int(s['page'])}" if isinstance(s.get("page"), int) else ""
-            match_str = (
-                f' · <span style="color:#818cf8">{s["match_pct"]}% similarity</span>'
-                if isinstance(s.get("match_pct"), int)
-                else ""
+
+            badges = s.get("badges")
+            if not badges:
+                # Backward-compatible conversion if source came from earlier session format
+                badges = []
+                m_type = str(s.get("match_type") or "")
+                pct = s.get("match_pct")
+                if "Categorical" in m_type:
+                    badges.append({"label": "🏷️ Exact Category Match", "css": "badge-category"})
+                if "FTS5" in m_type:
+                    badges.append({"label": "🔤 FTS5 Keyword Match", "css": "badge-fts"})
+                if "Vector" in m_type or not badges:
+                    vec_lbl = f"🧠 Semantic Vector ({pct}%)" if isinstance(pct, int) else "🧠 Semantic Vector"
+                    badges.append({"label": vec_lbl, "css": "badge-vector"})
+
+            badges_html = "".join(
+                f'<span class="match-badge {html.escape(b.get("css", "badge-vector"))}">'
+                f'{html.escape(b.get("label", ""))}</span>'
+                for b in badges
             )
-            match_type = str(s.get("match_type") or "").strip()
-            badge_html = (
-                f' <span class="file-pill" style="border-color:#4f46e5;color:#a5b4fc;">{html.escape(match_type)}</span>'
-                if match_type
-                else ""
-            )
+
             raw_text = str(s.get("text", ""))
             snippet = html.escape(raw_text[:450] + ("…" if len(raw_text) > 450 else ""))
             st.markdown(
                 f"""
                 <div class="source-card">
-                    <div><b>{idx}. 📄 {safe_source}{page_str}</b>{match_str}{badge_html}</div>
+                    <div class="source-header">
+                        <div><b>{idx}. 📄 {safe_source}{page_str}</b></div>
+                        <div class="source-badges">{badges_html}</div>
+                    </div>
                     <div class="source-snippet">{snippet}</div>
                 </div>
                 """,
@@ -529,12 +589,12 @@ def handle_user_question(question: str, session_id: str, store: Chroma) -> None:
             else:
                 placeholder.markdown(working_pill("Thinking"), unsafe_allow_html=True)
 
-                # Build complete session file manifest so the LLM always knows ALL uploaded files
+                # Build clean session file overview so the LLM knows all uploaded files
                 inv = get_session_inventory(session_id)
                 all_files = bucket.get("indexed_files") or [f["file_name"] for f in inv.get("files", [])]
                 if inv.get("files"):
                     file_lines = [
-                        f"- {f['file_name']} ({f['chunks']} rows/chunks"
+                        f"- {f['file_name']} ({f['chunks']} chunks"
                         + (f", sheets: {', '.join(f['sheets'])}" if f.get("sheets") else "")
                         + ")"
                         for f in inv["files"]
@@ -543,9 +603,9 @@ def handle_user_question(question: str, session_id: str, store: Chroma) -> None:
                     file_lines = [f"- {fname}" for fname in all_files]
 
                 manifest_header = (
-                    f"=== SESSION DOCUMENT INVENTORY (Total Indexed Files: {len(file_lines)}) ===\n"
+                    f"Uploaded Files in Current Session ({len(file_lines)} total):\n"
                     + "\n".join(file_lines)
-                    + "\n==================================================================\n\n"
+                    + "\n\nRetrieved Context Passages:\n"
                 )
 
                 passages_text = "\n\n".join(
@@ -565,6 +625,10 @@ def handle_user_question(question: str, session_id: str, store: Chroma) -> None:
                     placeholder.markdown(answer)
         else:
             placeholder.markdown(answer)
+
+        # Suppress misleading sources if the LLM stated the topic was not in the documents
+        if _is_not_found_answer(answer):
+            sources = []
 
         elapsed = time.time() - started
         if not errored:
