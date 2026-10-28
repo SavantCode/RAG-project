@@ -69,3 +69,65 @@ Running `pip freeze | Out-File -FilePath "requirements.txt" -Encoding utf8NoBOM`
   pip freeze | Out-File -FilePath "requirements.txt" -Encoding ascii
   ```
 * **Pipreqs Alternative:** Recommended `pipreqs . --force --encoding=utf8 --ignore ".venv,venv,chroma_db"` to generate clean, import-based dependency lists directly via Python UTF-8 file I/O.
+
+
+# 8
+```markdown
+## Issue 9: Conversational Context Loss & Topic-Switch Pollution in Multi-Turn Queries
+
+### ⚠️ Problem Statement
+Previously, multi-turn follow-up queries were handled by a naive 6-word rule:
+```python
+if len(question.split()) <= 6 and prior_messages:
+    search_query = f"{prev_user_qs[-1]} {question}"
+
+```
+
+This caused two critical RAG retrieval failures:
+
+1. **7+ Word Pronoun Follow-Ups Failed:** If Turn 1 asked "Tell me about the cow" and Turn 2 asked "How many stomach compartments do they have and what is their cultural significance?" (13 words), the `<= 6` rule did not trigger. The search engine queried "stomach compartments they have..." without the word "cow", losing Categorical/FTS5 precision.
+2. **Topic-Switch Pollution:** If Turn 1 asked "Tell me about the cow" and Turn 2 switched topics with "Tell me about the horse" (5 words), the old rule concatenated them into "Tell me about the cow Tell me about the horse", contaminating the search results with Cow chunks when the user asked about the Horse.
+
+### ✅ Engineering Solution: 2-Stage Hybrid Conversational Query Rewriter
+
+Implemented in `engine/llm_service.py` (`_needs_contextual_rewrite` + `rewrite_conversational_query`) and `prompts.py` (`QUERY_REWRITER_PROMPT`):
+
+1. **Stage 1: Zero-Latency Heuristic Gatekeeper** (`_needs_contextual_rewrite`, `<0.1ms`):
+* Immediately bypasses LLM rewriting if there is no prior chat history or if the query is a session meta-question (e.g., "how many files do you have").
+* Scans for referential pronouns (*it, they, their, its, this, that, those*), conversational starters (*what about, how much, compare, elaborate*), or short elliptical phrases (`<= 7 words`).
+
+
+2. **Stage 2: Fast LLM Coreference & Entity Resolution** (`rewrite_conversational_query`):
+* Sends the last 3 conversation turns (truncated for `<200ms` latency) to a fast Groq model (`llama-3.1-8b-instant` with `temperature=0.0`, `max_tokens=80`).
+* Resolves pronouns into explicit document entities, medicine names, and sheet names while leaving genuine topic switches untouched.
+
+
+3. **Stage 3: UI Search Telemetry** (`frontend/components.py`):
+* Displays `🔄 Searched: "<rewritten_query>"` in the response caption and inside the search status drawer whenever a query is contextualized.
+
+
+
+```
+
+---
+
+## 🧪 2. How to Test That the Feature Is Working (3 Quick Scenarios)
+
+| Test Scenario | What to Type in Chat | Expected Result |
+| :--- | :--- | :--- |
+| **Test 1: Long Pronoun Follow-Up (>6 words)** | **Turn 1:** `"Tell me about the cow"`<br>**Turn 2:** `"How many stomach compartments do they have and why are they sacred?"` | Under the answer, you see:<br>`🔄 Searched: "How many stomach compartments do cows have and why are cows sacred?"` and **100% of sources come from the Cow PDF**. |
+| **Test 2: Clean Topic Switch (<=6 words)** | **Turn 3:** `"Tell me about the horse"` | It recognizes you switched topics to the Horse—it does **not** glue `"cow"` onto your query, and retrieves only Horse chunks! |
+| **Test 3: Short Elliptical Follow-Up** | **Turn 4:** `"What about its speed and anatomy?"` | It resolves `"its"` to `"the horse"` and shows:<br>`🔄 Searched: "What is the speed and anatomy of the horse?"` |
+
+---
+
+## 🚀 3. Zero-Risk Git Procedure to Create a New Branch & Push
+
+Using the exact same **Zero-Risk (`-X ours`)** procedure that keeps your local files 100% untouched and prevents any conflicts with `main`:
+
+### Step 1: Create and switch to your new feature branch
+```powershell
+git checkout -b feature/smart-query-rewriter
+
+
+```
