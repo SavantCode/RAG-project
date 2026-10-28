@@ -1,5 +1,0 @@
-PS F:\development-world\AGENTIC ai\RAG project langchain\RAG_LangChain> python -m venv venv
-PS F:\development-world\AGENTIC ai\RAG project langchain\RAG_LangChain> .\venv\Scripts\activate
-(venv) PS F:\development-world\AGENTIC ai\RAG project langchain\RAG_LangChain> 
-(venv) PS F:\development-world\AGENTIC ai\RAG project langchain\RAG_LangChain> streamlit run main.py 
-s
