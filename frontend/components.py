@@ -1,9 +1,3 @@
-# 2. Update frontend/components.py
-# (Added .docx to the file uploader and added the 🌐 Add Website URLs expander + process_urls_action() in the sidebar while keeping 100% of your existing features intact!)
-
-# Copy and replace frontend/components.py with this complete file:
-
-
 """
 Separated Frontend UI Components Module.
 Renders Sidebar, Hero Banner, Source Citations, Suggested Follow-Ups, and Interactive Chat Interface.
@@ -24,8 +18,8 @@ Key Architectural Features:
 5. Grounded Auto-Generated Follow-Up Suggestions (`render_followup_pills`):
    Generates 3 clickable follow-up question buttons below the latest answer grounded in the
    retrieved source passages.
-6. Multi-Modal Ingestion (Excel, CSV, PDF, DOCX, TXT, MD + Live Website URLs):
-   Supports both file uploads (including Word `.docx`) and live Website URL scraping in the sidebar.
+6. Multi-Modal Ingestion (Excel, CSV, PDF, DOCX, TXT, MD + Live Website URLs) & Sheet-Aware Manifest:
+   Exposes exact Excel sheet counts and tab names from SQLite while staying within Groq TPM limits.
 """
 
 from __future__ import annotations
@@ -146,12 +140,12 @@ def get_session_display_name(session_id: str) -> str:
 def _is_not_found_answer(answer: str) -> bool:
     """
     Detect if the LLM explicitly stated that the answer was not found in the documents.
-    Used to suppress misleading low-similarity source citations on out-of-scope queries.
+    Handles both straight (') and curly (’) apostrophes as well as 'locate' phrasings.
     """
-    lower = answer.lower()
+    lower = answer.lower().replace("’", "'")
     not_found_patterns = (
-        r"could not find",
-        r"couldn't find",
+        r"could not (find|locate)",
+        r"couldn't (find|locate)",
         r"not mentioned in the (uploaded |provided )?documents",
         r"no information about",
         r"does not contain (any )?information",
@@ -433,7 +427,6 @@ def render_sidebar(session_id: str, store: Chroma | None) -> None:
         ):
             process_documents_action(uploaded_files, session_id, append_mode=append_mode)
 
-        # Enterprise Website URL Ingestion UI
         with st.expander("🌐 Add Website URLs", expanded=True):
             raw_urls_text = st.text_area(
                 "Website URL(s) (one per line)",
@@ -632,7 +625,10 @@ def render_followup_pills(followups: list[str], msg_idx: int, session_id: str) -
 
 
 def handle_user_question(question: str, session_id: str, store: Chroma) -> None:
-    """Execute Smart Query Rewriting, Phase 5 Hybrid Search, stream LLM answer, and generate follow-ups."""
+    """
+    Execute Smart Query Rewriting, Phase 5 Hybrid Search, Sheet-Aware Token-Safe Context Assembly,
+    Auto-Failover LLM Streaming, and Grounded Follow-Up Generation.
+    """
     clean_q = question.lower().strip()
     if clean_q in ["delete session", "delete this session", "clear session", "/delete"]:
         delete_session_action(session_id)
@@ -690,26 +686,86 @@ def handle_user_question(question: str, session_id: str, store: Chroma) -> None:
             else:
                 placeholder.markdown(working_pill("Thinking"), unsafe_allow_html=True)
 
+                # Sheet-Aware & Token-Safe Session Inventory Header
                 inv = get_session_inventory(session_id)
-                all_files = bucket.get("indexed_files") or [f["file_name"] for f in inv.get("files", [])]
-                if inv.get("files"):
-                    file_lines = [
-                        f"- {f['file_name']} ({f['chunks']} chunks"
-                        + (f", sheets: {', '.join(f['sheets'])}" if f.get("sheets") else "")
-                        + ")"
-                        for f in inv["files"]
-                    ]
-                else:
-                    file_lines = [f"- {fname}" for fname in all_files]
+                inv_files = inv.get("files", [])
+                if active_files:
+                    inv_files = [f for f in inv_files if f.get("file_name") in active_files]
 
-                manifest_header = (
-                    f"Uploaded Files in Current Session ({len(file_lines)} total):\n"
-                    + "\n".join(file_lines)
-                    + "\n\nRetrieved Context Passages:\n"
+                all_files = (
+                    active_files
+                    or bucket.get("indexed_files")
+                    or [f["file_name"] for f in inv_files]
+                )
+                total_file_count = len(all_files)
+                total_chunk_count = inv.get("total_chunks") or (store._collection.count() if store else 0)
+
+                is_inventory_query = any(
+                    kw in clean_q
+                    for kw in (
+                        "how many file", "what file", "which file", "list all file",
+                        "uploaded file", "files u have", "files do u have", "files you have",
+                        "how many document", "files processed",
+                        "how many sheet", "what sheet", "which sheet", "list all sheet",
+                        "sheet name", "sheets does", "sheets do", "sheets in", "sheet in",
+                        "how many tab", "what tab", "which tab", "tabs in", "name the sheet",
+                        "name them", "all sheet", "all tab",
+                    )
                 )
 
+                # Build formatted File + Excel Sheet Name descriptions from SQLite inventory
+                # Prioritize files whose names partially match the user's question (for 1,500-file scale)
+                q_tokens = set(re.findall(r"[a-z0-9]{3,}", clean_q))
+                sorted_inv_files = sorted(
+                    inv_files,
+                    key=lambda item: sum(
+                        1 for tok in q_tokens if tok in str(item.get("file_name", "")).lower()
+                    ),
+                    reverse=True,
+                )
+
+                file_sheet_lines: list[str] = []
+                total_sheet_count = 0
+                for f_item in sorted_inv_files[:120]:
+                    fname = str(f_item.get("file_name", "unknown"))
+                    raw_sheets = f_item.get("sheets") or []
+                    # Format sheet names cleanly (Title Case) so LLM reads them clearly
+                    pretty_sheets = [str(s).strip().title() for s in raw_sheets if str(s).strip()]
+                    total_sheet_count += len(pretty_sheets)
+                    if pretty_sheets:
+                        file_sheet_lines.append(
+                            f"- {fname} ({len(pretty_sheets)} sheet(s): {', '.join(pretty_sheets)})"
+                        )
+                    else:
+                        file_sheet_lines.append(f"- {fname}")
+
+                if is_inventory_query or total_file_count <= 25:
+                    # Include full File + Sheet Name breakdown so LLM can count & name every tab accurately
+                    manifest_body = (
+                        "\n".join(file_sheet_lines)
+                        if file_sheet_lines
+                        else ", ".join(all_files[:200])
+                    )
+                    manifest_header = (
+                        f"Session Overview: Total Indexed Files = {total_file_count} "
+                        f"| Total Excel Sheets = {total_sheet_count} "
+                        f"| Total Indexed Chunks = {total_chunk_count:,}\n"
+                        f"Uploaded Files & Their Sheet Tabs:\n{manifest_body}\n\n"
+                        f"Retrieved Context Passages:\n"
+                    )
+                else:
+                    # Compact summary for 26+ files on normal questions (still shows sheets for top 10 files)
+                    compact_sample = "; ".join(line.lstrip("- ") for line in file_sheet_lines[:10])
+                    more_suffix = f" (+{total_file_count - 10} more files)" if total_file_count > 10 else ""
+                    manifest_header = (
+                        f"Session Overview: Total Indexed Files = {total_file_count} "
+                        f"| Total Indexed Chunks = {total_chunk_count:,} "
+                        f"| Sample Sources & Sheets: {compact_sample}{more_suffix}\n\n"
+                        f"Retrieved Context Passages:\n"
+                    )
+
                 passages_text = "\n\n".join(
-                    f"Source ({s['source']}{', row/page ' + str(s['page']) if s.get('page') else ''}):\n{s['text']}"
+                    f"Source ({s['source']}{', row/page ' + str(s['page']) if s.get('page') else ''}):\n{s['text'][:1200]}"
                     for s in sources
                 )
                 context = manifest_header + passages_text
@@ -719,10 +775,24 @@ def handle_user_question(question: str, session_id: str, store: Chroma) -> None:
                     answer, used_model = stream_with_auto_fallback(prompt_msgs, placeholder)
                     placeholder.markdown(answer)
                 except Exception as exc:
-                    errored = True
-                    partial = f"{answer}\n\n" if answer.strip() else ""
-                    answer = f"{partial}⚠️ {friendly_error(exc)}"
-                    placeholder.markdown(answer)
+                    # Zero-Token Fallback: If Groq is rate-limited on a file/sheet count query, answer from SQLite!
+                    if is_inventory_query:
+                        details_block = (
+                            "\n".join(file_sheet_lines[:40])
+                            if file_sheet_lines
+                            else ", ".join(all_files[:40])
+                        )
+                        answer = (
+                            f"I have processed and indexed **{total_file_count} file(s)** "
+                            f"(**{total_sheet_count} Excel sheet(s)**, **{total_chunk_count:,} total chunks**) "
+                            f"in this session:\n\n{details_block}"
+                        )
+                        placeholder.markdown(answer)
+                    else:
+                        errored = True
+                        partial = f"{answer}\n\n" if answer.strip() else ""
+                        answer = f"{partial}⚠️ {friendly_error(exc)}"
+                        placeholder.markdown(answer)
         else:
             placeholder.markdown(answer)
 

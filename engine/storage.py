@@ -41,6 +41,7 @@ from engine.config import (
 from engine.hybrid_index import (
     delete_file_from_hybrid_db,
     detect_categorical_filters,
+    fetch_direct_sheet_chunks,
     get_session_inventory,
     index_micro_batch_into_hybrid_db,
     search_fts_keywords,
@@ -805,17 +806,28 @@ def hybrid_retrieve(
     use_mmr: bool = True,
     allowed_files: list[str] | None = None,
 ) -> list[dict]:
-    """Phase 5 Enterprise Multi-Stage Hybrid Search."""
+    """
+    Phase 5 Enterprise Multi-Stage Hybrid Search:
+    1. Detects `file_name`, `sheet_name`, and `medicine_name` filters (verified collision-free in SQLite).
+    2. If `sheet_filter` is matched, immediately pulls the Sheet Overview & Statistical Profile chunk
+       plus top matching rows for that exact sheet via `fetch_direct_sheet_chunks()` so sheet queries
+       NEVER return 'no data found'.
+    3. Combines Direct Sheet Hits + FTS5 BM25 Keyword Hits + ChromaDB Vector Search (with graceful
+       staged relaxation if ChromaDB MMR filter is too strict).
+    """
     detected = detect_categorical_filters(session_id, question, allowed_files=allowed_files)
-    med_filter = detected.get("medicine_name")
+    file_filter = detected.get("file_name")
     sheet_filter = detected.get("sheet_name")
+    med_filter = detected.get("medicine_name")
 
     conditions: list[dict] = []
     if med_filter:
         conditions.append({"medicine_name": med_filter})
     if sheet_filter:
         conditions.append({"sheet_name": sheet_filter})
-    if allowed_files:
+    if file_filter:
+        conditions.append({"file_name": file_filter})
+    elif allowed_files:
         if len(allowed_files) == 1:
             conditions.append({"file_name": allowed_files[0]})
         else:
@@ -827,15 +839,40 @@ def hybrid_retrieve(
     elif len(conditions) > 1:
         chroma_where = {"$and": conditions}
 
+    # Stage A: Guaranteed Direct Sheet Retrieval when a sheet tab is targeted
+    direct_sheet_hits: list[dict] = []
+    if sheet_filter:
+        direct_sheet_hits = fetch_direct_sheet_chunks(
+            session_id=session_id,
+            sheet_filter=sheet_filter,
+            question=question,
+            top_k=max(3, top_k // 2 + 1),
+            file_filter=file_filter,
+            allowed_files=allowed_files,
+        )
+
+    # Stage B: FTS5 Keyword Search (with automatic relaxation if strict filter yields 0 hits)
     fts_hits = search_fts_keywords(
         session_id=session_id,
         question=question,
-        top_k=max(2, top_k // 2),
+        top_k=max(3, top_k // 2),
         med_filter=med_filter,
         sheet_filter=sheet_filter,
+        file_filter=file_filter,
         allowed_files=allowed_files,
     )
+    if not fts_hits and (med_filter or sheet_filter):
+        fts_hits = search_fts_keywords(
+            session_id=session_id,
+            question=question,
+            top_k=max(2, top_k // 2),
+            med_filter=None,
+            sheet_filter=sheet_filter,
+            file_filter=file_filter,
+            allowed_files=allowed_files,
+        )
 
+    # Stage C: ChromaDB Vector Search (Similarity + MMR)
     score_lookup: dict[str, int] = {}
     try:
         scored_pairs = store.similarity_search_with_score(
@@ -849,11 +886,12 @@ def hybrid_retrieve(
         scored_pairs = []
 
     vector_results = []
-    used_cat_filter = bool(med_filter or sheet_filter)
+    used_cat_filter = bool(med_filter or sheet_filter or file_filter)
+
     try:
         if use_mmr:
             docs = store.max_marginal_relevance_search(
-                question, k=top_k, fetch_k=max(10, top_k * 3), filter=chroma_where
+                question, k=top_k, fetch_k=max(12, top_k * 3), filter=chroma_where
             )
             vector_results = [(d, None) for d in docs]
         else:
@@ -861,10 +899,13 @@ def hybrid_retrieve(
     except Exception:
         vector_results = []
 
+    # Fallback relaxation if strict Chroma filter returned 0 vector results
     if not vector_results and chroma_where is not None:
         used_cat_filter = False
         file_only_where: dict | None = None
-        if allowed_files:
+        if file_filter:
+            file_only_where = {"file_name": file_filter}
+        elif allowed_files:
             file_only_where = (
                 {"file_name": allowed_files[0]}
                 if len(allowed_files) == 1
@@ -881,7 +922,7 @@ def hybrid_retrieve(
 
             if use_mmr:
                 docs = store.max_marginal_relevance_search(
-                    question, k=top_k, fetch_k=max(10, top_k * 3), filter=file_only_where
+                    question, k=top_k, fetch_k=max(12, top_k * 3), filter=file_only_where
                 )
                 vector_results = [(d, None) for d in docs]
             else:
@@ -890,15 +931,21 @@ def hybrid_retrieve(
             fallback_docs = store.similarity_search(question, k=top_k)
             vector_results = [(d, None) for d in fallback_docs]
 
+    # Stage D: Deduplicated Multi-Signal Attribution Fusion
     merged_by_sig: dict[str, dict] = {}
     ordered_sigs: list[str] = []
 
-    for hit in fts_hits:
+    for hit in direct_sheet_hits + fts_hits:
         sig = hit["text"][:200]
         if sig not in merged_by_sig:
-            hit["match_pct"] = score_lookup.get(sig)
+            if hit.get("match_pct") is None:
+                hit["match_pct"] = score_lookup.get(sig)
             merged_by_sig[sig] = hit
             ordered_sigs.append(sig)
+        else:
+            existing = merged_by_sig[sig]
+            existing["matched_category"] = existing.get("matched_category") or hit.get("matched_category")
+            existing["matched_fts"] = existing.get("matched_fts") or hit.get("matched_fts")
 
     for doc, distance in vector_results:
         sig = doc.page_content[:200]
@@ -907,7 +954,6 @@ def hybrid_retrieve(
             if isinstance(distance, (int, float))
             else score_lookup.get(sig)
         )
-
         if sig in merged_by_sig:
             existing = merged_by_sig[sig]
             existing["matched_vector"] = True
