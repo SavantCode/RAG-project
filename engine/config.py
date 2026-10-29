@@ -31,5 +31,5 @@ FALLBACK_GROQ_MODELS = [
     "llama-3.1-8b-instant",
     "meta-llama/llama-4-scout-17b-16e-instruct",
     "qwen/qwen3-32b",
-    "openai/gpt-oss-20b",
+    "openai/gpt-oss-20ab",
 ]
